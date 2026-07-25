@@ -1,0 +1,32 @@
+name: pin-audit-ci
+on:
+  pull_request:
+    paths: ["superset-frontend/**"]
+
+jobs:
+  focused-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: superset-frontend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: npm ci
+      - name: Determine changed plugin/package dirs
+        id: changed
+        run: |
+          base=$(git merge-base origin/${{ github.base_ref }} HEAD)
+          dirs=$(git diff --name-only "$base" HEAD -- 'superset-frontend/plugins/**' 'superset-frontend/packages/**' \
+            | awk -F/ '{print $2"/"$3}' | sort -u | tr '\n' ' ')
+          echo "dirs=$dirs" >> "$GITHUB_OUTPUT"
+      - name: Run tests for changed dirs (or the smoke suite)
+        run: |
+          dirs="${{ steps.changed.outputs.dirs }}"
+          # Dependency-only bumps touch no plugin dir; the handlebars plugin
+          # is the designated smoke suite for those.
+          npm run test -- ${dirs:-plugins/plugin-chart-handlebars}

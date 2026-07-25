@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.sqlite3
+.venv/
+orchestrator.log
+spike/state.json

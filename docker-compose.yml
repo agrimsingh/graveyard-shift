@@ -1,0 +1,17 @@
+services:
+  orchestrator:
+    build: .
+    ports:
+      - "8090:8090"
+    environment:
+      DEVIN_API_KEY: ${DEVIN_API_KEY}
+      DEVIN_ORG_ID: ${DEVIN_ORG_ID}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      GS_FORK: ${GS_FORK:-agrimsingh/superset}
+      GS_PIN_ALLOWLIST: ${GS_PIN_ALLOWLIST:-}
+      GS_MAX_CONCURRENT: ${GS_MAX_CONCURRENT:-2}
+      GS_DB: /data/graveyard.sqlite3
+    volumes:
+      - gs-data:/data
+volumes:
+  gs-data:

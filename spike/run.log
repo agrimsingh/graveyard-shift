@@ -1,0 +1,62 @@
+created session 2ea7f0ac9545402c870e02eba0639f34
+watch live: https://app.devin.ai/sessions/2ea7f0ac9545402c870e02eba0639f34
+[14:33:53] running/working acus=0.0
+[14:35:25] running/waiting_for_user acus=0.0
+phase 1 complete; sending phase 2 message (tests resume check)
+[14:35:56] running/working acus=0.0
+[14:36:58] running/waiting_for_user acus=0.0
+
+=== SPIKE RESULT ===
+session: https://app.devin.ai/sessions/2ea7f0ac9545402c870e02eba0639f34
+acus_consumed: 0.0
+{
+  "notes": "Phase 1: Cloned https://github.com/agrimsingh/superset to /home/ubuntu/superset; default branch master. Extracted all 10 entries from the npm /superset-frontend/ ignore list in .github/dependabot.yml; most are scoped to version-update:semver-major, while react-icons, jest-environment-jsdom and @swc/plugin-transform-imports are ignored entirely.\n\nPhase 2 (test env verification, read-only): package.json engines require node ^24.16.0 / npm ^11.13.0; box default was node v20.18.1, so used nvm to install and switch to node v24.18.0 / npm 11.16.0. `npm ci` in superset-frontend took ~33s (3137 packages added; npm reported 8 audit vulnerabilities and 7 packages with uncovered install scripts \u2014 informational only). Ran `npm run test -- plugins/plugin-chart-handlebars` (expands to `cross-env NODE_ENV=test NODE_OPTIONS=\"--max-old-space-size=8192\" jest --max-workers=80% --silent plugins/plugin-chart-handlebars`): 6 suites / 20 tests, all passed in ~11s wall clock (jest reported 10.948s). Only warning: caniuse-lite browserslist data is 7 months old. No code modified, no PR opened.",
+  "tests_ran": true,
+  "test_command": "npm run test -- plugins/plugin-chart-handlebars",
+  "tests_passed": true,
+  "default_branch": "master",
+  "ignore_entries": [
+    {
+      "reason": "TODO: remove once the application supports React >= 19.0.0 (major updates ignored)",
+      "dependency_name": "react"
+    },
+    {
+      "reason": "TODO: remove once the application supports React >= 19.0.0 (major updates ignored)",
+      "dependency_name": "react-dom"
+    },
+    {
+      "reason": "TODO: remove once the application supports React >= 19.0.0 (major updates ignored)",
+      "dependency_name": "@types/react"
+    },
+    {
+      "reason": "TODO: remove once the application supports React >= 19.0.0 (major updates ignored)",
+      "dependency_name": "@types/react-dom"
+    },
+    {
+      "reason": "Covered by the same React >= 19.0.0 TODO block; fully ignored (no update-types filter)",
+      "dependency_name": "react-icons"
+    },
+    {
+      "reason": "JSDOM v30 doesn't play well with Jest v30. Source: https://jestjs.io/blog#known-issues, GH thread: https://github.com/jsdom/jsdom/issues/3492",
+      "dependency_name": "jest-environment-jsdom"
+    },
+    {
+      "reason": "Doesn't work with current Webpack-SWC hybrid setup (see https://github.com/apache/superset/pull/37384#issuecomment-3793991389); TODO: remove the plugin once Lodash usage has been migrated to a more readily tree-shakeable alternative",
+      "dependency_name": "@swc/plugin-transform-imports"
+    },
+    {
+      "reason": "`just-handlerbars-helpers` library in plugin-chart-handlebars requires `currencyformatter` to be < 2 (major updates ignored)",
+      "dependency_name": "currencyformatter.js"
+    },
+    {
+      "reason": "TODO: remove once https://github.com/pmmmwh/react-refresh-webpack-plugin/pull/940 lands in a release and https://github.com/apache/superset/issues/39600 is confirmed fixed (major updates ignored)",
+      "dependency_name": "react-checkbox-tree"
+    },
+    {
+      "reason": "Babel 8 (7.x -> 8.x) blocked on ecosystem: @emotion/babel-plugin (NodePath#hoist), babel-plugin-jsx-remove-data-test-id (t.jSXOpeningElement), and ts-jest rely on Babel APIs removed in v8. Coordinated major bump must be manual; TODO: remove when Babel 8 support is viable (major updates ignored)",
+      "dependency_name": "@babel/*"
+    }
+  ],
+  "repo_accessible": true
+}
+gates: {"fork_access": true, "structured_output": true, "message_resume": true, "tests_run": true}
