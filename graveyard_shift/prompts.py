@@ -44,10 +44,13 @@ Phase 1 (investigate only, change nothing yet):
 2. Investigate whether the documented blocker still holds. Check the linked \
 issues/PRs, upstream release notes, and the current code.
 3. Classify the pin via structured output:
-   - `fixable_here`: the blocker is in this repo's code and you can remediate \
-it now (upgrade the dependency, adapt the code, tests pass).
-   - `blocked_upstream`: an external project must ship first. Cite the \
-blocking issue/PR/release in evidence.
+   - `fixable_here`: this repo can get the upgrade now. That includes cases \
+where the nominal blocker is an external package, IF a bounded in-repo change \
+routes around it: replacing or vendoring a small dependency, npm overrides, \
+registering the needed functionality directly. Describe the route.
+   - `blocked_upstream`: an external project must ship first AND no reasonable \
+bounded in-repo change removes the dependency on that external work (e.g. a \
+framework-wide migration). Cite the blocking issue/PR/release in evidence.
    - `stale_pin`: the documented blocker no longer holds; the pin can be \
 removed and the upgrade applied.
 4. Include confidence (0-1), evidence with URLs, proposed_validation (the \
