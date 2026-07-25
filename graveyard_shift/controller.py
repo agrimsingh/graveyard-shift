@@ -6,7 +6,7 @@ import json
 import logging
 import time
 
-from . import config, dependabot, devin, gh, prompts, store
+from . import config, dependabot, devin, gh, prompts, store, watches
 
 logger = logging.getLogger("graveyard")
 
@@ -25,7 +25,8 @@ def sync_pins(conn) -> None:
 
 
 def admit(conn) -> None:
-    """Deterministic admission: capacity, allowlist, and the recheck clock."""
+    """Deterministic admission. A pin runs when it is due, and launching clears
+    the due date, so repeated ticks converge instead of relaunching forever."""
     capacity = config.MAX_CONCURRENT_RUNS - len(store.active_runs(conn))
     if capacity <= 0:
         return
@@ -35,13 +36,30 @@ def admit(conn) -> None:
             return
         if config.PIN_ALLOWLIST and pin["dependency"] not in config.PIN_ALLOWLIST:
             continue
-        if pin["recheck_after"] is not None and pin["recheck_after"] > now:
-            continue
         last = store.run_for_pin(conn, pin["id"])
-        if last is not None and (last["state"] in store.ACTIVE or pin["recheck_after"] is None):
-            continue  # active, or terminal without an expired recheck clock
+        if last is not None and last["state"] in store.ACTIVE:
+            continue
+        due_at = pin["due_at"]
+        if last is not None and last["state"] == store.BLOCKED_UPSTREAM:
+            due_at = fire_watch(conn, pin, last) or due_at
+        if due_at is None or due_at > now:
+            continue
         launch(conn, pin)
         capacity -= 1
+
+
+def fire_watch(conn, pin, run) -> float | None:
+    """Evaluate a stored unblock condition for zero ACUs. Firing clears the
+    watch, so a permanently-true condition cannot re-audit on every tick."""
+    if not pin["watch"]:
+        return None
+    flipped, reason = watches.is_unblocked(watches.parse(json.loads(pin["watch"])))
+    if not flipped:
+        return None
+    now = time.time()
+    conn.execute("UPDATE pins SET due_at = ?, watch = NULL WHERE id = ?", (now, pin["id"]))
+    store.log(conn, run["id"], "watch_unblocked", reason)
+    return now
 
 
 def launch(conn, pin) -> None:
@@ -95,7 +113,11 @@ def step(conn, run) -> None:
 
 def step_classifying(conn, run, pin, session) -> None:
     output = session.get("structured_output") or {}
-    if not output.get("classification") or not devin.is_idle(session):
+    if not output.get("classification"):
+        if session["status"] == "exit":
+            escalate(conn, run, pin, "session ended without returning a classification")
+        return
+    if not devin.is_idle(session):
         return
     classification = output["classification"]
     confidence = output.get("confidence", 0)
@@ -118,14 +140,22 @@ def step_classifying(conn, run, pin, session) -> None:
                    f"(confidence {confidence:.0%}). Remediation started.\n\n{evidence_md}\n\n"
                    f"Session: {run['session_url']}")
     elif classification == "blocked_upstream":
-        recheck = time.time() + config.RECHECK_DAYS * 86400
-        conn.execute("UPDATE pins SET recheck_after = ? WHERE id = ?", (recheck, pin["id"]))
+        watch = watches.parse(output.get("unblock_watch"))
+        already_true, why = watches.is_unblocked(watch)
+        if already_true:
+            watch = {"kind": "none", "note": f"condition already met at classification ({why})"}
+        conn.execute(
+            "UPDATE pins SET due_at = ?, watch = ? WHERE id = ?",
+            (time.time() + config.RECHECK_DAYS * 86400, json.dumps(watch), pin["id"]),
+        )
         store.transition(conn, run, store.BLOCKED_UPSTREAM, **fields)
         gh.set_labels(pin["issue_number"], ["pin-audit", "blocked-upstream"])
         gh.comment(pin["issue_number"],
                    f"**Devin classified this pin as `blocked_upstream`** "
                    f"(confidence {confidence:.0%}). Will re-audit in "
-                   f"{config.RECHECK_DAYS} days.\n\n{evidence_md}\n\n"
+                   f"{config.RECHECK_DAYS} days, or sooner if this watch "
+                   f"clears:\n```json\n{json.dumps(watch, indent=2)}\n```\n\n"
+                   f"{evidence_md}\n\n"
                    f"Session: {run['session_url']}")
     else:
         escalate(conn, run, pin, f"low confidence ({confidence:.0%}) on {classification}", fields)
@@ -137,8 +167,14 @@ def step_remediating(conn, run, pin, session) -> None:
         pr_url = prs[0]["pr_url"]
         store.transition(conn, run, store.AWAITING_CI, pr_url, pr_url=pr_url)
         gh.comment(pin["issue_number"], f"Devin opened {pr_url}. Watching CI.")
-    elif devin.is_idle(session) and session.get("status_detail") == "waiting_for_user":
-        escalate(conn, run, pin, "session stuck waiting for user input during remediation")
+        return
+    if session["status"] == "exit":
+        escalate(conn, run, pin, "session ended without opening a PR")
+    elif devin.is_idle(session) and (
+        # Devin idles briefly mid-task, so one idle observation is not stuck.
+        time.time() - run["updated_at"] > config.REMEDIATION_GRACE_SECONDS
+    ):
+        escalate(conn, run, pin, "idle without a PR past the remediation grace period")
 
 
 def step_awaiting_ci(conn, run, pin, session) -> None:

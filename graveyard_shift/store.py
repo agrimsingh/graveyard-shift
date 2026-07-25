@@ -32,8 +32,9 @@ CREATE TABLE IF NOT EXISTS pins (
     directory TEXT NOT NULL,
     reason TEXT NOT NULL,
     entry_hash TEXT NOT NULL,
-    recheck_after REAL,
-    issue_number INTEGER
+    due_at REAL,
+    issue_number INTEGER,
+    watch TEXT
 );
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY,
@@ -65,6 +66,11 @@ def db():
     conn = sqlite3.connect(config.DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(pins)")}
+    if "recheck_after" in cols and "due_at" not in cols:
+        conn.execute("ALTER TABLE pins RENAME COLUMN recheck_after TO due_at")
+    if "watch" not in cols:
+        conn.execute("ALTER TABLE pins ADD COLUMN watch TEXT")
     try:
         yield conn
         conn.commit()
@@ -76,14 +82,14 @@ def upsert_pin(conn, dependency: str, directory: str, reason: str, entry_hash: s
     row = conn.execute("SELECT * FROM pins WHERE dependency = ?", (dependency,)).fetchone()
     if row is None:
         conn.execute(
-            "INSERT INTO pins (dependency, directory, reason, entry_hash) VALUES (?, ?, ?, ?)",
+            "INSERT INTO pins (dependency, directory, reason, entry_hash, due_at)"
+            " VALUES (?, ?, ?, ?, 0)",
             (dependency, directory, reason, entry_hash),
         )
         log(conn, None, "pin_discovered", dependency)
     elif row["entry_hash"] != entry_hash:
-        # Entry changed upstream: reset the recheck clock so it gets re-audited.
         conn.execute(
-            "UPDATE pins SET reason = ?, entry_hash = ?, recheck_after = NULL WHERE id = ?",
+            "UPDATE pins SET reason = ?, entry_hash = ?, due_at = 0, watch = NULL WHERE id = ?",
             (reason, entry_hash, row["id"]),
         )
         log(conn, None, "pin_changed", dependency)
@@ -92,6 +98,9 @@ def upsert_pin(conn, dependency: str, directory: str, reason: str, entry_hash: s
 
 def create_run(conn, pin_id: int, session_id: str, session_url: str) -> int:
     now = time.time()
+    # Launching consumes the due date. Without this a pin whose due date has
+    # passed is re-admitted on every tick, one Devin session per pass.
+    conn.execute("UPDATE pins SET due_at = NULL WHERE id = ?", (pin_id,))
     cursor = conn.execute(
         "INSERT INTO runs (pin_id, session_id, session_url, state, created_at, updated_at)"
         " VALUES (?, ?, ?, ?, ?, ?)",

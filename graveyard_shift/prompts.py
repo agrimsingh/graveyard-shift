@@ -24,8 +24,29 @@ CLASSIFICATION_SCHEMA = {
         "proposed_validation": {"type": "string"},
         "estimated_scope": {"type": "string", "enum": ["small", "medium", "large"]},
         "remediation_summary": {"type": "string"},
+        "unblock_watch": {
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["npm_version"]},
+                        "package": {"type": "string"},
+                        "min_version": {"type": "string"},
+                    },
+                    "required": ["kind", "package", "min_version"],
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["none"]},
+                        "note": {"type": "string"},
+                    },
+                    "required": ["kind", "note"],
+                },
+            ],
+        },
     },
-    "required": ["classification", "confidence", "evidence"],
+    "required": ["classification", "confidence", "evidence", "unblock_watch"],
 }
 
 
@@ -55,6 +76,11 @@ framework-wide migration). Cite the blocking issue/PR/release in evidence.
 removed and the upgrade applied.
 4. Include confidence (0-1), evidence with URLs, proposed_validation (the \
 exact test command that would prove a fix), and estimated_scope.
+5. Set `unblock_watch` to the condition that would clear this pin. For \
+`blocked_upstream`, use \
+`{{"kind":"npm_version","package":"...","min_version":"..."}}` when an npm \
+release is the gate; otherwise `{{"kind":"none","note":"..."}}`. Other \
+classifications may use kind `none`.
 
 Stop after providing structured output. You will receive a follow-up message \
 if remediation should proceed. Do not commit, push, or open a PR in phase 1.
