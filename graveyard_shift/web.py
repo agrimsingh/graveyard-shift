@@ -49,8 +49,10 @@ def dashboard() -> str:
     with store.db() as conn:
         summary = store.metrics(conn)
         run_rows = conn.execute(
-            "SELECT r.*, p.dependency, p.issue_number FROM runs r"
-            " JOIN pins p ON p.id = r.pin_id ORDER BY r.id DESC"
+            "SELECT r.*, p.dependency, p.issue_number,"
+            " r.id <> (SELECT id FROM runs WHERE pin_id = r.pin_id"
+            "          ORDER BY created_at DESC, id DESC LIMIT 1) AS superseded"
+            " FROM runs r JOIN pins p ON p.id = r.pin_id ORDER BY r.id DESC"
         ).fetchall()
         event_rows = conn.execute(
             "SELECT e.*, p.dependency FROM events e"
@@ -81,8 +83,11 @@ def dashboard() -> str:
         pr = f"<a href='{r['pr_url']}'>PR</a>" if r["pr_url"] else "–"
         color = state_colors.get(r["state"], "#666")
         elapsed = int(r["updated_at"] - r["created_at"])
+        # Re-audited pins keep their earlier runs visible, dimmed, so the
+        # history stays readable without polluting the current picture.
+        tr = "<tr style='opacity:.4' title='superseded by a later audit'>" if r["superseded"] else "<tr>"
         return (
-            f"<tr><td>{r['dependency']}</td>"
+            f"{tr}<td>{r['dependency']}</td>"
             f"<td><span class='pill' style='background:{color}'>{r['state']}</span></td>"
             f"<td>{r['classification'] or '–'}</td><td>{confidence}</td>"
             f"<td>{elapsed // 60}m {elapsed % 60}s</td><td>{r['attempts']}</td>"
