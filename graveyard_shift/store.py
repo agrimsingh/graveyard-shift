@@ -160,30 +160,36 @@ def _median(values: list[float]) -> int | None:
     return round((ordered[middle - 1] + ordered[middle]) / 2)
 
 
+# A pin can be audited more than once, as an unblock watch fires or the
+# question put to Devin improves. The dashboard reports where each pin stands
+# now, so every metric reads the most recent run per pin. Superseded runs stay
+# in the table and remain linkable from the run feed.
+LATEST_RUNS = """SELECT * FROM runs r WHERE r.id = (
+    SELECT id FROM runs WHERE pin_id = r.pin_id ORDER BY created_at DESC, id DESC LIMIT 1
+)"""
+
+
 def _elapsed_to(conn, kind: str) -> list[float]:
     """Seconds from a run's creation to the first time it reached a state."""
     rows = conn.execute(
-        "SELECT r.created_at, MIN(e.at) FROM runs r JOIN events e ON e.run_id = r.id"
-        " WHERE e.kind = ? GROUP BY r.id",
+        f"SELECT r.created_at, MIN(e.at) FROM ({LATEST_RUNS}) r"
+        " JOIN events e ON e.run_id = r.id WHERE e.kind = ? GROUP BY r.id",
         (kind,),
     ).fetchall()
     return [reached - created for created, reached in rows]
 
 
 def metrics(conn) -> dict:
+    def count(where: str) -> int:
+        return conn.execute(f"SELECT COUNT(*) FROM ({LATEST_RUNS}) WHERE {where}").fetchone()[0]
+
     by_state = dict(
-        conn.execute("SELECT state, COUNT(*) FROM runs GROUP BY state").fetchall()
+        conn.execute(f"SELECT state, COUNT(*) FROM ({LATEST_RUNS}) GROUP BY state").fetchall()
     )
-    audited = conn.execute(
-        "SELECT COUNT(*) FROM runs WHERE classification IS NOT NULL"
-    ).fetchone()[0]
-    actionable = conn.execute(
-        "SELECT COUNT(*) FROM runs WHERE classification IN ('fixable_here', 'stale_pin')"
-    ).fetchone()[0]
+    audited = count("classification IS NOT NULL")
+    actionable = count("classification IN ('fixable_here', 'stale_pin')")
     greens = by_state.get(GREEN, 0)
-    first_pass = conn.execute(
-        "SELECT COUNT(*) FROM runs WHERE state = 'green' AND attempts = 0"
-    ).fetchone()[0]
+    first_pass = count(f"state = '{GREEN}' AND attempts = 0")
     return {
         "pins_tracked": conn.execute("SELECT COUNT(*) FROM pins").fetchone()[0],
         "audits_completed": audited,
@@ -192,7 +198,8 @@ def metrics(conn) -> dict:
         "first_pass_ci": f"{first_pass}/{greens}" if greens else None,
         "median_trigger_to_pr_s": _median(_elapsed_to(conn, f"state:{AWAITING_CI}")),
         "median_trigger_to_green_s": _median(_elapsed_to(conn, f"state:{GREEN}")),
-        "ci_retries": conn.execute("SELECT COALESCE(SUM(attempts), 0) FROM runs").fetchone()[0],
+        "ci_retries": conn.execute(
+            f"SELECT COALESCE(SUM(attempts), 0) FROM ({LATEST_RUNS})").fetchone()[0],
         "human_escalations": by_state.get(ESCALATED, 0),
         "runs_by_state": by_state,
     }

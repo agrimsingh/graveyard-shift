@@ -34,28 +34,65 @@ merged automatically.
 Working against [agrimsingh/superset](https://github.com/agrimsingh/superset),
 a fork of `apache/superset`:
 
-| Pin | Verdict | Result |
-| --- | --- | --- |
-| `currencyformatter.js` | `fixable_here` (90%) | [PR #3](https://github.com/agrimsingh/superset/pull/3), green CI |
-| `react-checkbox-tree` | `blocked_upstream` (85%) | [Issue #2](https://github.com/agrimsingh/superset/issues/2), parked with evidence and a watch |
+| Pin | Verdict | Result | Trigger to green |
+| --- | --- | --- | --- |
+| `currencyformatter.js` | `fixable_here` (90%) | [PR #3](https://github.com/agrimsingh/superset/pull/3), green | 10m 25s |
+| `react-checkbox-tree` | `fixable_here` (72%) | [PR #4](https://github.com/agrimsingh/superset/pull/4), green | 14m 49s |
 
-The interesting part is that these two pins look identical from the outside.
-Both are major-version ignores blocked on an external project. Devin
-distinguished them.
+Both pins had sat in the ignore list behind upstream projects that had not
+shipped a fix. Devin got around both without waiting for either.
 
-For `react-checkbox-tree` it found that the upstream fix
-([react-refresh-webpack-plugin#940](https://github.com/pmmmwh/react-refresh-webpack-plugin/pull/940))
-had merged but never shipped, and proved it by unpacking the published 0.6.2
-tarball and finding none of the fix in it. Correctly parked.
+For `currencyformatter.js` the blocker was a stale peer range in an
+unmaintained helper library. Devin verified the 2.x API was unchanged, routed
+around the range with an npm override rather than waiting for an upstream that
+has published nothing since 2022, removed the ignore entry, and wrote three
+regression tests covering USD, a German-locale EUR case, and an unknown
+currency code.
 
-For `currencyformatter.js` it found the blocker was a stale peer range in an
-unmaintained helper library, verified the 2.x API was unchanged, and routed
-around it with an npm override rather than waiting for an upstream that has
-published nothing since 2022. It removed the ignore entry, bumped the
-dependency, and wrote three regression tests covering USD, a German-locale EUR
-case, and an unknown currency code.
+`react-checkbox-tree` is the harder one, and worth reading the
+[diff](https://github.com/agrimsingh/superset/pull/4/files). Superset had
+already tried this upgrade once: it broke the dashboard filter-scope UI with
+`Cannot set properties of undefined (setting 'runtime')`, and they reverted it
+in [apache/superset#39660](https://github.com/apache/superset/pull/39660) and
+pinned it. The ignore comment blames an unreleased fix in
+[react-refresh-webpack-plugin#940](https://github.com/pmmmwh/react-refresh-webpack-plugin/pull/940).
 
-A dependency bot cannot make either call.
+Devin confirmed that story, then went past it. It found the real mechanism: the
+2.x ESM artifact is itself a webpack bundle that declares a top-level
+`__webpack_require__`, which shadows the host compilation's runtime, so the
+React Refresh runtime writes `$Refresh$` onto the wrong object. The package's
+CommonJS artifact keeps its nested runtime inside a factory scope, so it does
+not shadow. The fix is a three-line `resolve.alias` — no upstream release
+required:
+
+```js
+// The CommonJS artifact keeps its nested runtime inside a factory function
+// scope, so no shadowing occurs. Resolve to it until the Refresh plugin ships
+// https://github.com/pmmmwh/react-refresh-webpack-plugin/pull/940.
+'react-checkbox-tree$': 'react-checkbox-tree/lib/index.cjs',
+```
+
+It cited the webpack issue describing the shadowing class of bug, unpacked the
+published tarballs to check which artifacts contained what, and adapted
+`FilterScopeSelector.tsx` to the 2.x API. A dependency bot cannot produce that.
+
+### The prompt was the lever, not the model
+
+Worth being direct about, because it is the most transferable finding here.
+
+The first version of the audit asked Devin one question: is this pin still
+blocked? Both pins came back `blocked_upstream` with good evidence — runs 1 and
+2 are still in the run feed, and the reasoning was correct. The upstream fixes
+genuinely have not shipped. It was a true answer and a useless one, because it
+leaves the pins exactly where they were.
+
+The second version asked a better question: is this still blocked, and if so,
+is there a bounded route around it inside this repository? Same model, same
+repository, same pins. Both flipped to `fixable_here` and both produced green
+pull requests.
+
+The agent's judgment is bounded by the question it is handed. The leverage came
+from asking for the workaround.
 
 ## How it works
 
@@ -99,6 +136,14 @@ classifying -> remediating -> awaiting_ci -> green
 Devin session. Splitting them would double the cost and throw away the
 environment Devin already built, including the cloned repo and installed
 dependencies.
+
+**Advance on artifacts, not on session mood.** The controller originally waited
+for a session to go idle before reading its classification, on the assumption
+that Devin pauses once it has decided. It does not. On the `react-checkbox-tree`
+run it emitted its verdict and continued straight into remediation, opening a
+pull request while the controller sat waiting for a pause that never came. Every
+transition now keys off a durable artifact — structured output, a PR URL, a
+check conclusion — and never off how busy the session looks.
 
 **The reconciler is idempotent.** Every tick reads the world and advances each
 run by at most one step, so a crash mid-tick loses nothing. Admission consumes
@@ -174,28 +219,45 @@ The dashboard answers the question an engineering leader actually asks.
 | `ci_retries` | Repair rounds consumed |
 | `human_escalations` | Where the system knew to stop |
 
-Every run links to its Devin session, so any number on the dashboard can be
-traced to the work that produced it.
+A pin can be audited more than once, when a watch fires or the question
+improves. Every metric reports the most recent run per pin, so the dashboard
+answers "where does this pin stand now" rather than "how many attempts have
+there been". Superseded runs stay in the feed. Every run links to its Devin
+session, so any number can be traced to the work that produced it.
 
-On the live Superset run: trigger to PR was 8m 18s, trigger to green was
-10m 25s, first-pass CI was 1/1, and there were no escalations.
+Current state of the Superset fork: 2 pins audited, 100% actionable, 2 green
+PRs, 2/2 first-pass CI, median 10m 29s trigger to PR, no escalations.
 
 ### Honest caveats
 
 **Cost per fix is not reported.** The account used here reports zero ACU
 consumption at both the session and organization level, so any cost-per-fix
-number would be fabricated. Consumption is still recorded per run, and the
+number would be fabricated. Consumption is still recorded per run and the
 figure becomes meaningful on a metered account. Until then wall-clock time to
 green is the defensible signal.
 
-**Green means the focused suite.** Superset's full CI matrix is impractical on
-a personal fork, so `scripts/setup_fork_ci.sh` installs a workflow that runs
-the tests for the packages a PR actually touches. That is the signal the
-feedback loop reacts to.
+**Two of the best behaviours never fired live.** CI passed first time on both
+PRs, so the feedback loop never had a failure to repair, and both pins turned
+out fixable, so no unblock watch was ever armed. Both paths are exercised and
+asserted in `scripts/simulate.py`. Treat them as tested, not as field-proven.
+
+**Green means the scoped suite.** Superset's full CI matrix is impractical on a
+personal fork, so `scripts/setup_fork_ci.sh` installs a workflow that runs the
+tests covering the directories a PR touches. PR #4 ran the 21 filterscope tests;
+PR #3 ran the 20 handlebars plugin tests. Neither covers the dev-server HMR
+behaviour that originally broke `react-checkbox-tree`, which is exactly why a
+human still approves the merge.
+
+**I pushed two empty commits to PR #4.** The first version of the CI workflow
+resolved its diff from the wrong working directory, so its pathspec matched
+nothing and every PR silently fell back to a smoke suite that did not cover the
+changed code. PR #4 was reporting green on tests unrelated to its own diff. I
+fixed the workflow and pushed empty commits to re-trigger CI against the real
+scope. No source was changed, and `first_pass_ci` counts Devin repair rounds, of
+which there were none.
 
 **Two pins, deliberately.** The remaining eight are tracked and classifiable,
-but the point was to prove the loop end to end rather than to maximise a
-funnel.
+but the point was to prove the loop end to end rather than to maximise a funnel.
 
 ## Layout
 
