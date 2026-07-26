@@ -150,30 +150,49 @@ def run_for_pin(conn, pin_id: int):
     ).fetchone()
 
 
+def _median(values: list[float]) -> int | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return round(ordered[middle])
+    return round((ordered[middle - 1] + ordered[middle]) / 2)
+
+
+def _elapsed_to(conn, kind: str) -> list[float]:
+    """Seconds from a run's creation to the first time it reached a state."""
+    rows = conn.execute(
+        "SELECT r.created_at, MIN(e.at) FROM runs r JOIN events e ON e.run_id = r.id"
+        " WHERE e.kind = ? GROUP BY r.id",
+        (kind,),
+    ).fetchall()
+    return [reached - created for created, reached in rows]
+
+
 def metrics(conn) -> dict:
     by_state = dict(
         conn.execute("SELECT state, COUNT(*) FROM runs GROUP BY state").fetchall()
     )
-    greens = conn.execute(
-        "SELECT r.created_at, e.at, r.acus FROM runs r JOIN events e ON e.run_id = r.id"
-        " AND e.kind = 'state:green' WHERE r.state = 'green'"
-    ).fetchall()
-    time_to_green = [e - c for c, e, _ in greens]
-    classified = conn.execute(
+    audited = conn.execute(
         "SELECT COUNT(*) FROM runs WHERE classification IS NOT NULL"
     ).fetchone()[0]
     actionable = conn.execute(
         "SELECT COUNT(*) FROM runs WHERE classification IN ('fixable_here', 'stale_pin')"
     ).fetchone()[0]
+    greens = by_state.get(GREEN, 0)
+    first_pass = conn.execute(
+        "SELECT COUNT(*) FROM runs WHERE state = 'green' AND attempts = 0"
+    ).fetchone()[0]
     return {
-        "pins_total": conn.execute("SELECT COUNT(*) FROM pins").fetchone()[0],
+        "pins_tracked": conn.execute("SELECT COUNT(*) FROM pins").fetchone()[0],
+        "audits_completed": audited,
+        "actionable_rate": round(actionable / audited, 2) if audited else None,
+        "green_prs": greens,
+        "first_pass_ci": f"{first_pass}/{greens}" if greens else None,
+        "median_trigger_to_pr_s": _median(_elapsed_to(conn, f"state:{AWAITING_CI}")),
+        "median_trigger_to_green_s": _median(_elapsed_to(conn, f"state:{GREEN}")),
+        "ci_retries": conn.execute("SELECT COALESCE(SUM(attempts), 0) FROM runs").fetchone()[0],
+        "human_escalations": by_state.get(ESCALATED, 0),
         "runs_by_state": by_state,
-        "classified": classified,
-        "actionable": actionable,
-        "actionable_rate": round(actionable / classified, 2) if classified else None,
-        "green_prs": len(greens),
-        "avg_time_to_green_s": round(sum(time_to_green) / len(time_to_green)) if time_to_green else None,
-        "acus_per_green": round(sum(a for _, _, a in greens) / len(greens), 1) if greens else None,
-        "total_acus": conn.execute("SELECT COALESCE(SUM(acus), 0) FROM runs").fetchone()[0],
-        "escalations": by_state.get(ESCALATED, 0),
     }

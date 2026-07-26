@@ -62,20 +62,30 @@ def dashboard() -> str:
         "classifying": "#6366f1", "remediating": "#f59e0b", "awaiting_ci": "#0ea5e9",
         "green": "#10b981", "blocked_upstream": "#ef4444", "escalated": "#b91c1c",
     }
+    def card(key: str, value) -> str:
+        label = key.removesuffix("_s").replace("_", " ")
+        if value is None:
+            shown = "–"
+        elif key.endswith("_s"):
+            shown = f"{int(value) // 60}m {int(value) % 60}s"
+        else:
+            shown = value
+        return (f"<div class='card'><div class='num'>{shown}</div>"
+                f"<div class='label'>{label}</div></div>")
+
     cards = "".join(
-        f"<div class='card'><div class='num'>{value if value is not None else '–'}</div>"
-        f"<div class='label'>{key.replace('_', ' ')}</div></div>"
-        for key, value in summary.items() if key != "runs_by_state"
+        card(key, value) for key, value in summary.items() if key != "runs_by_state"
     )
     def row_html(r) -> str:
         confidence = f"{r['confidence']:.0%}" if r["confidence"] is not None else "–"
         pr = f"<a href='{r['pr_url']}'>PR</a>" if r["pr_url"] else "–"
         color = state_colors.get(r["state"], "#666")
+        elapsed = int(r["updated_at"] - r["created_at"])
         return (
             f"<tr><td>{r['dependency']}</td>"
             f"<td><span class='pill' style='background:{color}'>{r['state']}</span></td>"
             f"<td>{r['classification'] or '–'}</td><td>{confidence}</td>"
-            f"<td>{r['acus']:.1f}</td><td>{r['attempts']}</td>"
+            f"<td>{elapsed // 60}m {elapsed % 60}s</td><td>{r['attempts']}</td>"
             f"<td><a href='{r['session_url']}'>session</a></td><td>{pr}</td></tr>"
         )
 
@@ -102,6 +112,6 @@ li b {{ color: #e6edf3; }}
 <h1>graveyard-shift · Dependabot ignore-list audit</h1>
 <div class="cards">{cards}</div>
 <table><tr><th>pin</th><th>state</th><th>classification</th><th>confidence</th>
-<th>ACUs</th><th>retries</th><th>devin</th><th>pr</th></tr>{rows}</table>
+<th>elapsed</th><th>ci retries</th><th>devin</th><th>pr</th></tr>{rows}</table>
 <h1>event feed</h1><ul>{feed}</ul>
 </body></html>"""

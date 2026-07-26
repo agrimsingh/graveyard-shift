@@ -183,9 +183,11 @@ def step_awaiting_ci(conn, run, pin, session) -> None:
         return
     if checks["conclusion"] == "success":
         store.transition(conn, run, store.GREEN, run["pr_url"])
+        elapsed = int(time.time() - run["created_at"])
         gh.comment(pin["issue_number"],
                    f"CI is green on {run['pr_url']}. Ready for human review. "
-                   f"ACUs consumed: {session['acus_consumed']}.")
+                   f"Trigger to green: {elapsed // 60}m {elapsed % 60}s, "
+                   f"CI retries: {run['attempts']}.")
     elif run["attempts"] < config.RETRY_LIMIT:
         devin.send_message(run["session_id"], prompts.ci_feedback_message(checks["failures"]))
         store.transition(conn, run, store.REMEDIATING, "ci feedback sent",
