@@ -112,12 +112,13 @@ def step(conn, run) -> None:
 
 
 def step_classifying(conn, run, pin, session) -> None:
+    # Devin does not reliably pause after deciding; it often continues straight
+    # into remediation. The verdict is the structured output, not an idle
+    # session, so act on the artifact and let remediation catch up.
     output = session.get("structured_output") or {}
     if not output.get("classification"):
         if session["status"] == "exit":
             escalate(conn, run, pin, "session ended without returning a classification")
-        return
-    if not devin.is_idle(session):
         return
     classification = output["classification"]
     confidence = output.get("confidence", 0)

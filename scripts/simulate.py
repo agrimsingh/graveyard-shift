@@ -27,7 +27,10 @@ from graveyard_shift import controller, devin, gh, store  # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parent.parent / "fixtures" / "dependabot.yml"
 
-WAITING = {"status": "running", "status_detail": "waiting_for_user"}
+# Devin usually keeps working after emitting its verdict rather than pausing
+# for instructions, so the fake never idles. The controller has to advance on
+# the structured output alone.
+WORKING = {"status": "running", "status_detail": "working"}
 PR = "https://github.com/agrimsingh/superset/pull/42"
 
 CLASSIFICATIONS = {
@@ -74,7 +77,7 @@ class FakeDevin:
             "acus_consumed": 0.0,
             "pull_requests": [],
             "structured_output": CLASSIFICATIONS[dependency],
-            **WAITING,
+            **WORKING,
         }
         return self.sessions[session_id]
 
