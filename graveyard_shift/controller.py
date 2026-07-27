@@ -13,7 +13,12 @@ logger = logging.getLogger("graveyard")
 
 def tick() -> None:
     with store.db() as conn:
-        sync_pins(conn)
+        try:
+            sync_pins(conn)
+        except Exception:
+            # Discovering new pins is the least urgent thing a tick does. A
+            # GitHub blip must not stop in-flight runs from being reconciled.
+            logger.exception("pin sync failed; reconciling existing runs anyway")
         reconcile_runs(conn)
         admit(conn)
 
@@ -128,7 +133,9 @@ def step_classifying(conn, run, pin, session) -> None:
         "confidence": confidence,
         "evidence": json.dumps(evidence),
     }
-    evidence_md = "\n".join(f"- {e.get('url', '')} {e['summary']}" for e in evidence)
+    evidence_md = "\n".join(
+        f"- {e.get('url', '')} {e.get('summary', '')}" for e in evidence
+    )
 
     if classification in ("fixable_here", "stale_pin") and confidence >= config.CONFIDENCE_THRESHOLD:
         devin.send_message(run["session_id"], prompts.remediation_message(
@@ -163,24 +170,40 @@ def step_classifying(conn, run, pin, session) -> None:
 
 
 def step_remediating(conn, run, pin, session) -> None:
+    """Remediating means waiting for code we have not judged yet. On a repair
+    round the pull request already exists, so its mere presence proves nothing;
+    only a commit newer than the one we failed does."""
     prs = session.get("pull_requests") or []
     if prs:
-        pr_url = prs[0]["pr_url"]
-        store.transition(conn, run, store.AWAITING_CI, pr_url, pr_url=pr_url)
-        gh.comment(pin["issue_number"], f"Devin opened {pr_url}. Watching CI.")
-        return
+        pr_url = prs[-1]["pr_url"]
+        if pr_url != run["pr_url"]:
+            store.transition(conn, run, store.AWAITING_CI, pr_url, pr_url=pr_url)
+            gh.comment(pin["issue_number"], f"Devin opened {pr_url}. Watching CI.")
+            return
+        if gh.pr_head_sha(pr_url) != run["judged_sha"]:
+            store.transition(conn, run, store.AWAITING_CI, "new commit pushed")
+            return
+
+    waiting_for = time.time() - run["updated_at"]
     if session["status"] == "exit":
-        escalate(conn, run, pin, "session ended without opening a PR")
-    elif devin.is_idle(session) and (
+        escalate(conn, run, pin, "session ended without new code")
+    elif waiting_for > config.REMEDIATION_TIMEOUT_SECONDS:
+        # Devin does not always idle when stuck, so idleness alone cannot be
+        # the only way out of this state.
+        escalate(conn, run, pin, f"no new code after {int(waiting_for) // 60}m")
+    elif devin.is_idle(session) and waiting_for > config.REMEDIATION_GRACE_SECONDS:
         # Devin idles briefly mid-task, so one idle observation is not stuck.
-        time.time() - run["updated_at"] > config.REMEDIATION_GRACE_SECONDS
-    ):
-        escalate(conn, run, pin, "idle without a PR past the remediation grace period")
+        escalate(conn, run, pin, "idle without new code past the grace period")
 
 
 def step_awaiting_ci(conn, run, pin, session) -> None:
     checks = gh.pr_checks(run["pr_url"])
     if checks["conclusion"] == "pending":
+        return
+    if checks["head_sha"] == run["judged_sha"]:
+        # We already ruled on this commit and asked for a repair. GitHub will
+        # keep reporting that same failure until Devin pushes, and acting on it
+        # again would burn the retry budget on a verdict we have already used.
         return
     if checks["conclusion"] == "success":
         store.transition(conn, run, store.GREEN, run["pr_url"])
@@ -192,7 +215,7 @@ def step_awaiting_ci(conn, run, pin, session) -> None:
     elif run["attempts"] < config.RETRY_LIMIT:
         devin.send_message(run["session_id"], prompts.ci_feedback_message(checks["failures"]))
         store.transition(conn, run, store.REMEDIATING, "ci feedback sent",
-                         attempts=run["attempts"] + 1)
+                         attempts=run["attempts"] + 1, judged_sha=checks["head_sha"])
         gh.comment(pin["issue_number"],
                    f"CI failed (attempt {run['attempts'] + 1}). Failure logs sent back "
                    f"to the same Devin session.")

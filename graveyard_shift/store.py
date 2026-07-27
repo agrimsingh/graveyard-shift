@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS runs (
     confidence REAL,
     evidence TEXT NOT NULL DEFAULT '[]',
     pr_url TEXT,
+    judged_sha TEXT,
     attempts INTEGER NOT NULL DEFAULT 0,
     acus REAL NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
@@ -71,6 +72,8 @@ def db():
         conn.execute("ALTER TABLE pins RENAME COLUMN recheck_after TO due_at")
     if "watch" not in cols:
         conn.execute("ALTER TABLE pins ADD COLUMN watch TEXT")
+    if "judged_sha" not in {row[1] for row in conn.execute("PRAGMA table_info(runs)")}:
+        conn.execute("ALTER TABLE runs ADD COLUMN judged_sha TEXT")
     try:
         yield conn
         conn.commit()
@@ -123,11 +126,11 @@ def transition(conn, run: sqlite3.Row, new_state: str, detail: str = "", **field
 
 
 def update_run(conn, run_id: int, **fields) -> None:
+    """Heartbeat writes only. updated_at deliberately means "when the state
+    last changed": the reconciler measures grace periods and timeouts against
+    it, so touching it on every poll would hold those clocks at zero."""
     sets = ", ".join(f"{k} = ?" for k in fields)
-    conn.execute(
-        f"UPDATE runs SET {sets}, updated_at = ? WHERE id = ?",
-        (*fields.values(), time.time(), run_id),
-    )
+    conn.execute(f"UPDATE runs SET {sets} WHERE id = ?", (*fields.values(), run_id))
 
 
 def log(conn, run_id, kind: str, detail: str = "") -> None:

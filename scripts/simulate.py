@@ -89,18 +89,37 @@ class FakeDevin:
         session = self.sessions[session_id]
         if not session["pull_requests"]:
             session["pull_requests"] = [{"pr_url": PR, "pr_state": "open"}]
+            fake_gh.push(PR, passing=False)
             print(f"    devin resumed, opened {PR}")
         else:
-            print("    devin resumed with CI failure logs, pushed a fix")
+            # Devin takes several ticks to react. The controller therefore
+            # polls the failing commit again before any repair exists, which is
+            # the case that used to burn the retry budget and escalate.
+            self.pending_push = 3
+            print("    devin resumed with CI failure logs, working on a repair")
         return session
+
+    def maybe_push(self):
+        if getattr(self, "pending_push", 0):
+            self.pending_push -= 1
+            if self.pending_push == 0:
+                fake_gh.push(PR, passing=True)
+                print("    devin pushed a repair commit")
 
 
 class FakeGitHub:
-    """CI fails once on the remediation PR, then passes after Devin's repair."""
+    """CI results belong to a commit, not to a pull request. GitHub keeps
+    reporting the same failure until new code is pushed, so the fake does too.
+    A fake that flipped to success on the second poll would hide a controller
+    that never actually waits for the repair."""
 
     def __init__(self):
         self.issues = {}
-        self.check_calls = 0
+        self.heads = {}
+
+    def push(self, pr_url, passing):
+        head = f"sha{len(self.heads.get(pr_url, [])) + 1}"
+        self.heads.setdefault(pr_url, []).append((head, passing))
 
     def fetch_file(self, path, ref=None):
         return FIXTURE.read_text()
@@ -121,28 +140,33 @@ class FakeGitHub:
     def set_labels(self, issue_number, labels):
         self.issues[issue_number]["labels"] = labels
 
+    def pr_head_sha(self, pr_url):
+        return self.heads[pr_url][-1][0]
+
     def pr_checks(self, pr_url):
-        self.check_calls += 1
-        if self.check_calls == 1:
-            print("    CI failed on the PR")
-            return {"conclusion": "failure", "failures": [{
-                "name": "focused-tests",
-                "url": "https://github.com/agrimsingh/superset/actions/runs/1",
-                "summary": "FAIL formatCurrencyHelper.test.ts: expected $1,234,567.89",
-            }]}
-        print("    CI passed on the PR")
-        return {"conclusion": "success", "failures": []}
+        head, passing = self.heads[pr_url][-1]
+        if passing:
+            print(f"    CI passed on {head}")
+            return {"conclusion": "success", "head_sha": head, "failures": []}
+        print(f"    CI failed on {head}")
+        return {"conclusion": "failure", "head_sha": head, "failures": [{
+            "name": "focused-tests",
+            "url": "https://github.com/agrimsingh/superset/actions/runs/1",
+            "summary": "FAIL formatCurrencyHelper.test.ts: expected $1,234,567.89",
+        }]}
 
 
 fake_devin, fake_gh = FakeDevin(), FakeGitHub()
 for name in ("create_session", "get_session", "send_message"):
     setattr(devin, name, getattr(fake_devin, name))
-for name in ("fetch_file", "ensure_labels", "create_issue", "comment", "set_labels", "pr_checks"):
+for name in ("fetch_file", "ensure_labels", "create_issue", "comment", "set_labels",
+             "pr_checks", "pr_head_sha"):
     setattr(gh, name, getattr(fake_gh, name))
 
 print("Simulating the scheduled audit. Each tick reconciles every run by one step.\n")
-for number in range(1, 7):
+for number in range(1, 13):
     print(f"tick {number}")
+    fake_devin.maybe_push()
     controller.tick()
     with store.db() as conn:
         for run in conn.execute(

@@ -69,19 +69,31 @@ def set_labels(issue_number: int, labels: list[str]) -> None:
     _request("PUT", f"/repos/{config.FORK}/issues/{issue_number}/labels", {"labels": labels})
 
 
+def pr_head_sha(pr_url: str) -> str:
+    number = int(pr_url.rstrip("/").split("/")[-1])
+    return _request("GET", f"/repos/{config.FORK}/pulls/{number}")["head"]["sha"]
+
+
 def pr_checks(pr_url: str) -> dict:
-    """Aggregate check-run state for a PR. Returns {conclusion, failures: [...]}.
-    conclusion is 'pending' | 'success' | 'failure'."""
+    """Aggregate check-run state for a PR's current head commit. Returns
+    {conclusion, head_sha, failures: [...]}. conclusion is 'pending' |
+    'success' | 'failure'. The head SHA matters: a verdict belongs to the
+    commit it was computed from, not to the pull request."""
     number = int(pr_url.rstrip("/").split("/")[-1])
     pr = _request("GET", f"/repos/{config.FORK}/pulls/{number}")
+    head_sha = pr["head"]["sha"]
     checks = _request(
-        "GET", f"/repos/{config.FORK}/commits/{pr['head']['sha']}/check-runs?per_page=100"
+        "GET", f"/repos/{config.FORK}/commits/{head_sha}/check-runs?per_page=100"
     )["check_runs"]
     if not checks or any(c["status"] != "completed" for c in checks):
-        return {"conclusion": "pending", "failures": []}
+        return {"conclusion": "pending", "head_sha": head_sha, "failures": []}
     failures = [
         {"name": c["name"], "url": c["html_url"], "summary": (c["output"]["summary"] or "")[:2000]}
         for c in checks
         if c["conclusion"] not in ("success", "neutral", "skipped")
     ]
-    return {"conclusion": "failure" if failures else "success", "failures": failures}
+    return {
+        "conclusion": "failure" if failures else "success",
+        "head_sha": head_sha,
+        "failures": failures,
+    }
