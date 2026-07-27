@@ -51,7 +51,10 @@ def _process_state(pid: int) -> str:
 
 def _start_time_of(pid: int) -> str:
     result = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "lstart="], capture_output=True, text=True
+        ["ps", "-p", str(pid), "-o", "lstart="],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "LC_ALL": "C"},
     )
     return " ".join(result.stdout.split())
 

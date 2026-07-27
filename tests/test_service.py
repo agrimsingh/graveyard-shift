@@ -28,6 +28,18 @@ def write_record(path: Path, pid: int = 410) -> None:
 
 
 class StopServiceTests(unittest.TestCase):
+    def test_start_time_uses_stable_locale(self) -> None:
+        # Given
+        result = mock.Mock(stdout="Mon Jul 27 12:00:00 2026\n")
+
+        # When
+        with mock.patch.object(service.subprocess, "run", return_value=result) as run:
+            start_time = service._start_time_of(410)
+
+        # Then
+        self.assertEqual(start_time, START_TIME)
+        self.assertEqual(run.call_args.kwargs["env"]["LC_ALL"], "C")
+
     def test_start_records_pid_port_and_database_launch_identity(self) -> None:
         # Given
         with tempfile.TemporaryDirectory() as directory:
