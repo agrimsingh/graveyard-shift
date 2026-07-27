@@ -109,5 +109,25 @@ for dep in ("grouped-a", "grouped-b", "grouped-c"):
     seed(dep, None, 0, reason="blocked on the same migration")
 results.append(case("pins sharing a justification run one at a time", 1, ticks(5)))
 
+
+def settle_all_runs() -> None:
+    """Retire every run left behind by earlier cases.
+
+    The cap counts live runs, so without this the next case would measure the
+    accumulated debris of this file rather than the limit.
+    """
+    with store.db() as conn:
+        conn.execute("UPDATE runs SET state = ?", (store.GREEN,))
+
+
+# The cap is the spend guardrail. A graveyard of forty pins that all come due on
+# the same pass must not open forty concurrent Devin sessions.
+settle_all_runs()
+config.MAX_CONCURRENT_RUNS = 2
+for dep in ("capped-a", "capped-b", "capped-c", "capped-d"):
+    seed(dep, None, 0)
+results.append(case("concurrency cap admits no more than its limit", 2, ticks(5)))
+config.MAX_CONCURRENT_RUNS = 10
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

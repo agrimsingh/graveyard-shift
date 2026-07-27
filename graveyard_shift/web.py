@@ -1,10 +1,12 @@
 """Dashboard and control surface. One page answers the leadership question:
 is this working, what did it cost, where are the humans needed."""
 
-import json
+import html
+import secrets
 import time
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 
 from . import config, controller, store
@@ -16,8 +18,9 @@ app = FastAPI(title="graveyard-shift")
 def health() -> dict:
     """Liveness of the reconciler, which a converged system cannot show through
     its data because it stops writing any."""
+    controller_status = controller.status()
     return {
-        "ticks_completed": controller.TICKS_COMPLETED,
+        **controller_status,
         "tick_seconds": config.TICK_SECONDS,
         "fork": config.FORK,
         "pin_allowlist": config.PIN_ALLOWLIST,
@@ -51,10 +54,68 @@ def events(limit: int = 100) -> list:
 
 
 @app.post("/api/tick")
-def trigger_tick() -> dict:
+def trigger_tick(authorization: str | None = Header(default=None)) -> dict:
     """Manual trigger for demos and the replay workflow."""
+    if not config.CONTROL_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="manual tick control is disabled until GS_CONTROL_TOKEN is configured",
+        )
+    scheme, separator, supplied = (authorization or "").partition(" ")
+    if (
+        not separator
+        or scheme.lower() != "bearer"
+        or not secrets.compare_digest(supplied, config.CONTROL_TOKEN)
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="valid bearer token required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     controller.tick()
+    tick_status = controller.status()
+    error_at = tick_status["last_tick_error_at"]
+    started_at = tick_status["last_tick_started_at"]
+    if (
+        tick_status["last_tick_error"]
+        and error_at is not None
+        and started_at is not None
+        and error_at >= started_at
+    ):
+        raise HTTPException(
+            status_code=502,
+            detail=f"manual tick completed with upstream error: "
+            f"{tick_status['last_tick_error']}",
+        )
     return {"ok": True, "at": time.time()}
+
+
+def _text(value) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def _safe_http_url(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 80, 443}
+    ):
+        return None
+    return _text(value)
+
+
+def _link(value, label: str) -> str:
+    safe_url = _safe_http_url(value)
+    return f"<a href='{safe_url}'>{_text(label)}</a>" if safe_url else "–"
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -85,32 +146,33 @@ def dashboard() -> str:
             shown = f"{int(value) // 60}m {int(value) % 60}s"
         else:
             shown = value
-        return (f"<div class='card'><div class='num'>{shown}</div>"
-                f"<div class='label'>{label}</div></div>")
+        return (f"<div class='card'><div class='num'>{_text(shown)}</div>"
+                f"<div class='label'>{_text(label)}</div></div>")
 
     cards = "".join(
         card(key, value) for key, value in summary.items() if key != "runs_by_state"
     )
     def row_html(r) -> str:
         confidence = f"{r['confidence']:.0%}" if r["confidence"] is not None else "–"
-        pr = f"<a href='{r['pr_url']}'>PR</a>" if r["pr_url"] else "–"
+        pr = _link(r["pr_url"], "PR")
         color = state_colors.get(r["state"], "#666")
         elapsed = int(r["updated_at"] - r["created_at"])
         # Re-audited pins keep their earlier runs visible, dimmed, so the
         # history stays readable without polluting the current picture.
         tr = "<tr style='opacity:.4' title='superseded by a later audit'>" if r["superseded"] else "<tr>"
         return (
-            f"{tr}<td>{r['dependency']}</td>"
-            f"<td><span class='pill' style='background:{color}'>{r['state']}</span></td>"
-            f"<td>{r['classification'] or '–'}</td><td>{confidence}</td>"
-            f"<td>{elapsed // 60}m {elapsed % 60}s</td><td>{r['attempts']}</td>"
-            f"<td><a href='{r['session_url']}'>session</a></td><td>{pr}</td></tr>"
+            f"{tr}<td>{_text(r['dependency'])}</td>"
+            f"<td><span class='pill' style='background:{color}'>{_text(r['state'])}</span></td>"
+            f"<td>{_text(r['classification'] or '–')}</td><td>{_text(confidence)}</td>"
+            f"<td>{elapsed // 60}m {elapsed % 60}s</td><td>{_text(r['attempts'])}</td>"
+            f"<td>{_link(r['session_url'], 'session')}</td><td>{pr}</td></tr>"
         )
 
     rows = "".join(row_html(r) for r in run_rows)
     feed = "".join(
-        f"<li><code>{time.strftime('%m-%d %H:%M', time.localtime(e['at']))}</code> "
-        f"<b>{e['kind']}</b> {e['dependency'] or ''} {e['detail'][:120]}</li>"
+        f"<li><code>{_text(time.strftime('%m-%d %H:%M', time.localtime(e['at'])))}</code> "
+        f"<b>{_text(e['kind'])}</b> {_text(e['dependency'] or '')} "
+        f"{_text(e['detail'][:120])}</li>"
         for e in event_rows
     )
     return f"""<!doctype html><html><head><title>graveyard-shift</title>

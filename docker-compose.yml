@@ -2,12 +2,17 @@ services:
   orchestrator:
     build: .
     ports:
-      - "8090:8090"
+      - "127.0.0.1:8090:8090"
     environment:
       DEVIN_API_KEY: ${DEVIN_API_KEY}
       DEVIN_ORG_ID: ${DEVIN_ORG_ID}
       GITHUB_TOKEN: ${GITHUB_TOKEN}
+      # Must listen on all interfaces inside the container for the published
+      # port to reach it; the port above is published to host loopback only.
+      GS_BIND: 0.0.0.0
+      GS_CONTROL_TOKEN: ${GS_CONTROL_TOKEN:-}
       GS_FORK: ${GS_FORK:-agrimsingh/superset}
+      GS_ALLOWED_FORKS: ${GS_ALLOWED_FORKS:-agrimsingh/superset}
       GS_PIN_ALLOWLIST: ${GS_PIN_ALLOWLIST:-}
       GS_MAX_CONCURRENT: ${GS_MAX_CONCURRENT:-2}
       GS_DB: /data/graveyard.sqlite3

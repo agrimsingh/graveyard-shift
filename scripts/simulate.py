@@ -79,6 +79,7 @@ class FakeDevin:
     def __init__(self):
         self.sessions = {}
         self.messages = []
+        self.terminated_session_ids = []
 
     def create_session(self, prompt, title, tags, structured_output_schema, max_acu_limit=0):
         dependency = title.split(": ", 1)[1]
@@ -95,6 +96,17 @@ class FakeDevin:
 
     def get_session(self, session_id):
         return self.sessions[session_id]
+
+    def terminate_session(self, session_id):
+        session = self.sessions[session_id]
+        session["status"] = "exit"
+        session["status_detail"] = "finished"
+        self.terminated_session_ids.append(session_id)
+        return session
+
+    def stop_session(self, session_id):
+        if self.sessions[session_id]["status"] != "exit":
+            self.terminate_session(session_id)
 
     def send_message(self, session_id, message):
         self.messages.append((session_id, message))
@@ -179,7 +191,13 @@ class FakeGitHub:
 
 
 fake_devin, fake_gh = FakeDevin(), FakeGitHub()
-for name in ("create_session", "get_session", "send_message"):
+for name in (
+    "create_session",
+    "get_session",
+    "send_message",
+    "stop_session",
+    "terminate_session",
+):
     setattr(devin, name, getattr(fake_devin, name))
 for name in ("fetch_file", "ensure_labels", "create_issue", "comment", "set_labels",
              "pr_checks", "pr_head_sha"):
@@ -223,6 +241,8 @@ checks = {
         state_of.get("mystery-pin") == store.ESCALATED,
     "a PR no workflow watches escalates instead of hanging":
         state_of.get("config-only-pin") == store.ESCALATED,
+    "every terminal run stopped its fake Devin session":
+        set(fake_devin.terminated_session_ids) == set(fake_devin.sessions),
 }
 print()
 for label, passed in checks.items():

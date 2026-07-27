@@ -5,11 +5,13 @@ The point of the PID file is identity. Killing whatever happens to hold port
 goes to a process this module started and can still recognise.
 """
 
+import json
 import os
 import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -25,6 +27,14 @@ DASHBOARD = f"http://localhost:{config.PORT}"
 FINGERPRINT = "graveyard_shift"
 
 
+@dataclass(frozen=True, slots=True)
+class ProcessRecord:
+    pid: int
+    port: int
+    database: str
+    start_time: str
+
+
 def _command_of(pid: int) -> str:
     result = subprocess.run(
         ["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True
@@ -32,10 +42,30 @@ def _command_of(pid: int) -> str:
     return result.stdout.strip()
 
 
+def _process_state(pid: int) -> str:
+    result = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "state="], capture_output=True, text=True
+    )
+    return result.stdout.strip()
+
+
+def _start_time_of(pid: int) -> str:
+    result = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "lstart="], capture_output=True, text=True
+    )
+    return " ".join(result.stdout.split())
+
+
 def _alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
     except (ProcessLookupError, PermissionError):
+        return False
+    if _process_state(pid).startswith("Z"):
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
         return False
     return True
 
@@ -52,33 +82,104 @@ def _pid_on_port() -> int | None:
 
 def running_pid() -> int | None:
     """The orchestrator we manage, if it is still up."""
-    for pid in (_recorded_pid(), _pid_on_port()):
-        if pid and _alive(pid) and FINGERPRINT in _command_of(pid):
-            return pid
+    record = _recorded_process()
+    if record is None:
+        return None
+    _require_current_identity(record)
+    _require_same_process(record)
+    if _alive(record.pid) and FINGERPRINT in _command_of(record.pid):
+        return record.pid
     return None
 
 
-def _recorded_pid() -> int | None:
+def _recorded_process() -> ProcessRecord | None:
     if not PID_FILE.exists():
         return None
+    raw = PID_FILE.read_text()
+    if raw.strip().isdigit():
+        raise RuntimeError(
+            f"legacy PID file {PID_FILE} has no launch identity; "
+            "refusing to signal it"
+        )
     try:
-        return int(PID_FILE.read_text().strip())
-    except ValueError:
-        return None
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid orchestrator PID metadata in {PID_FILE}") from exc
+    match data:
+        case {
+            "pid": int(pid),
+            "port": int(port),
+            "database": str(database),
+            "start_time": str(start_time),
+        }:
+            return ProcessRecord(
+                pid=pid,
+                port=port,
+                database=database,
+                start_time=start_time,
+            )
+        case _:
+            raise RuntimeError(f"invalid orchestrator PID metadata in {PID_FILE}")
+
+
+def _require_current_identity(record: ProcessRecord) -> None:
+    current_database = str(config.DB_PATH.resolve())
+    if record.port != config.PORT or record.database != current_database:
+        raise RuntimeError(
+            "orchestrator launch identity mismatch: "
+            f"recorded port={record.port}, database={record.database!r}; "
+            f"current port={config.PORT}, database={current_database!r}. "
+            "No process was signalled."
+        )
+
+
+def _require_same_process(record: ProcessRecord) -> None:
+    start_time = _start_time_of(record.pid)
+    if not start_time:
+        raise RuntimeError(
+            f"could not read process start time for recorded pid {record.pid}; "
+            "no process was signalled"
+        )
+    if start_time != record.start_time:
+        raise RuntimeError(
+            f"process start time mismatch for recorded pid {record.pid}: "
+            f"recorded {record.start_time!r}, current {start_time!r}. "
+            "No process was signalled."
+        )
 
 
 def stop(timeout: float = 15.0) -> str:
     """Stop the orchestrator. Returns a human-readable outcome, or raises if
     the port is held by something we do not recognise."""
-    pid = _pid_on_port()
+    record = _recorded_process()
+    if record is not None:
+        _require_current_identity(record)
+        _require_same_process(record)
+    pid = record.pid if record is not None else None
+    listener_pid = _pid_on_port()
     if pid is None:
+        if listener_pid is not None:
+            raise RuntimeError(
+                f"port {config.PORT} is held by pid {listener_pid}, but there is "
+                "no recorded orchestrator PID. Stop it yourself and rerun."
+            )
         PID_FILE.unlink(missing_ok=True)
         return "nothing was running"
+
+    if listener_pid is not None and listener_pid != pid:
+        raise RuntimeError(
+            f"port {config.PORT} is held by pid {listener_pid}, which does not "
+            f"match recorded pid {pid}. Neither process was signalled."
+        )
+
+    if not _alive(pid):
+        PID_FILE.unlink(missing_ok=True)
+        return f"recorded pid {pid} was not running"
 
     command = _command_of(pid)
     if FINGERPRINT not in command:
         raise RuntimeError(
-            f"port {config.PORT} is held by pid {pid}, which is not an "
+            f"recorded pid {pid} is not an "
             f"orchestrator: {command[:120]!r}. Stop it yourself and rerun."
         )
 
@@ -93,6 +194,32 @@ def stop(timeout: float = 15.0) -> str:
     os.kill(pid, signal.SIGKILL)
     PID_FILE.unlink(missing_ok=True)
     return f"force-stopped pid {pid} after it ignored SIGTERM"
+
+
+def send_tick() -> dict:
+    """Trigger one reconciliation pass over the authenticated control endpoint.
+
+    The token lives in .env, which only this process reads, so a hand-typed
+    `curl -H "Authorization: Bearer $GS_CONTROL_TOKEN"` sends an empty token and
+    gets a 401. Going through here is what makes the command reproducible.
+    """
+    if not config.CONTROL_TOKEN:
+        raise RuntimeError(
+            "GS_CONTROL_TOKEN is unset, so the control endpoint is disabled. "
+            "Add it to .env (see .env.example)."
+        )
+    response = httpx.post(
+        f"{DASHBOARD}/api/tick",
+        headers={"Authorization": f"Bearer {config.CONTROL_TOKEN}"},
+        timeout=120,
+    )
+    if response.status_code == 401:
+        raise RuntimeError(
+            "the control endpoint rejected the token in .env. The running service "
+            "was started with a different GS_CONTROL_TOKEN; restart it."
+        )
+    response.raise_for_status()
+    return response.json()
 
 
 def wait_for_first_tick(timeout: float = 60.0) -> int:
@@ -124,18 +251,39 @@ def start(env_overrides: dict, timeout: float = 40.0) -> int:
     # it can never disagree about which file they mean.
     env.setdefault("GS_DB", str(config.DB_PATH))
 
-    log = LOG_FILE.open("a")
-    log.write(f"\n=== started {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
-    log.flush()
-    process = subprocess.Popen(
-        [sys.executable, "-m", "graveyard_shift"],
-        cwd=config.ROOT,
-        env=env,
-        stdout=log,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
+    with LOG_FILE.open("a") as log:
+        log.write(f"\n=== started {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+        log.flush()
+        process = subprocess.Popen(
+            [sys.executable, "-m", "graveyard_shift"],
+            cwd=config.ROOT,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    start_time = _start_time_of(process.pid)
+    if not start_time:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        raise RuntimeError(
+            f"could not read start time for launched pid {process.pid}; "
+            "the process was stopped and no PID record was written"
+        )
+    PID_FILE.write_text(
+        json.dumps(
+            {
+                "pid": process.pid,
+                "port": int(env.get("GS_PORT", config.PORT)),
+                "database": str(Path(env["GS_DB"]).resolve()),
+                "start_time": start_time,
+            }
+        )
     )
-    PID_FILE.write_text(str(process.pid))
 
     deadline = time.time() + timeout
     while time.time() < deadline:

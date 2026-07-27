@@ -1,32 +1,65 @@
-"""The reconciler. Every tick is idempotent: it reads the world (Devin
-sessions, GitHub checks, dependabot.yml) and advances each run's state
-machine at most one step. Crashing mid-tick loses nothing."""
+"""Idempotent reconciliation of Devin sessions, GitHub checks, and Dependabot pins."""
 
 import json
 import logging
+import threading
 import time
+from typing import TypedDict
 
 from . import config, dependabot, devin, gh, prompts, store, watches
 
 logger = logging.getLogger("graveyard")
 
-# Completed reconciliation passes. Liveness of the reconciler is not visible
-# from the data alone, because a converged system writes nothing.
-TICKS_COMPLETED = 0
+_TICK_LOCK = threading.Lock()
+_STATUS_LOCK = threading.Lock()
+_LABELS_READY = False
+
+
+class ControllerStatus(TypedDict):
+    ticks_completed: int
+    last_tick_started_at: float | None
+    last_tick_completed_at: float | None
+    last_tick_error: str | None
+    last_tick_error_at: float | None
+
+
+_STATUS = ControllerStatus(ticks_completed=0, last_tick_started_at=None, last_tick_completed_at=None, last_tick_error=None, last_tick_error_at=None)
+
+
+def status() -> ControllerStatus:
+    with _STATUS_LOCK:
+        return _STATUS.copy()
 
 
 def tick() -> None:
-    global TICKS_COMPLETED
-    with store.db() as conn:
+    global _LABELS_READY
+    with _TICK_LOCK:
+        with _STATUS_LOCK:
+            _STATUS["last_tick_started_at"] = time.time()
+        tick_error = None
         try:
-            sync_pins(conn)
-        except Exception:
-            # Discovering new pins is the least urgent thing a tick does. A
-            # GitHub blip must not stop in-flight runs from being reconciled.
-            logger.exception("pin sync failed; reconciling existing runs anyway")
-        reconcile_runs(conn)
-        admit(conn)
-    TICKS_COMPLETED += 1
+            if not _LABELS_READY:
+                gh.ensure_labels()
+                _LABELS_READY = True
+            with store.db() as conn:
+                try:
+                    sync_pins(conn)
+                except Exception as exc:
+                    tick_error = f"{type(exc).__name__}: {exc}"
+                    logger.exception("pin sync failed; reconciling existing runs anyway")
+                reconcile_runs(conn)
+            admit()
+        except Exception as exc:
+            with _STATUS_LOCK:
+                _STATUS["last_tick_error"] = f"{type(exc).__name__}: {exc}"
+                _STATUS["last_tick_error_at"] = time.time()
+            raise
+        completed_at = time.time()
+        with _STATUS_LOCK:
+            _STATUS["ticks_completed"] += 1
+            _STATUS["last_tick_completed_at"] = completed_at
+            _STATUS["last_tick_error"] = tick_error
+            _STATUS["last_tick_error_at"] = completed_at if tick_error else None
 
 
 def sync_pins(conn) -> None:
@@ -35,47 +68,36 @@ def sync_pins(conn) -> None:
         store.upsert_pin(conn, entry.dependency, entry.directory, entry.reason, entry.entry_hash)
 
 
-def admit(conn) -> None:
-    """Deterministic admission. A pin runs when it is due, and launching clears
-    the due date, so repeated ticks converge instead of relaunching forever."""
-    capacity = config.MAX_CONCURRENT_RUNS - len(store.active_runs(conn))
-    if capacity <= 0:
-        return
+def admit(_conn=None) -> None:
     now = time.time()
-    # A Dependabot author writes one comment above a block of entries because
-    # those entries move together. Five React pins sharing one TODO are one
-    # migration, not five, so admitting a second member while the first is in
-    # flight buys a duplicate session and a conflicting pull request.
-    busy_groups = store.active_group_keys(conn)
-    for pin in conn.execute("SELECT * FROM pins").fetchall():
-        if capacity <= 0:
-            return
-        if config.PIN_ALLOWLIST and pin["dependency"] not in config.PIN_ALLOWLIST:
+    due_pins = []
+    with store.db() as conn:
+        for pin in conn.execute("SELECT * FROM pins").fetchall():
+            if config.PIN_ALLOWLIST and pin["dependency"] not in config.PIN_ALLOWLIST:
+                continue
+            last = store.run_for_pin(conn, pin["id"])
+            if last is not None and last["state"] in store.ACTIVE:
+                continue
+            due_at = pin["due_at"]
+            if last is None and due_at is None:
+                due_at = 0
+            if last is not None and last["state"] == store.BLOCKED_UPSTREAM:
+                due_at = fire_watch(conn, pin, last) or due_at
+            if due_at is not None and due_at <= now:
+                due_pins.append(pin)
+    for pin in due_pins:
+        claim_token = store.claim_pin(pin["id"])
+        if claim_token is None:
             continue
-        if store.group_key(pin) in busy_groups:
-            continue
-        last = store.run_for_pin(conn, pin["id"])
-        if last is not None and last["state"] in store.ACTIVE:
-            continue
-        due_at = pin["due_at"]
-        if last is None and due_at is None:
-            # A null due date means "no scheduled reason to run". For a pin
-            # that has never been audited at all there is a standing reason, so
-            # it is due now. This also self-heals a pin whose row was written
-            # before a launch failed partway through.
-            due_at = 0
-        if last is not None and last["state"] == store.BLOCKED_UPSTREAM:
-            due_at = fire_watch(conn, pin, last) or due_at
-        if due_at is None or due_at > now:
-            continue
-        launch(conn, pin)
-        busy_groups.add(store.group_key(pin))
-        capacity -= 1
+        try:
+            launch(pin, claim_token)
+        except Exception as exc:
+            store.release_claim(claim_token, f"{type(exc).__name__}: {exc}")
+            raise
 
 
 def fire_watch(conn, pin, run) -> float | None:
-    """Evaluate a stored unblock condition for zero ACUs. Firing clears the
-    watch, so a permanently-true condition cannot re-audit on every tick."""
+    """Evaluate a stored unblock condition once without spending Devin ACUs."""
     if not pin["watch"]:
         return None
     flipped, reason = watches.is_unblocked(watches.parse(json.loads(pin["watch"])))
@@ -87,7 +109,7 @@ def fire_watch(conn, pin, run) -> float | None:
     return now
 
 
-def launch(conn, pin) -> None:
+def launch(pin, claim_token: str) -> None:
     issue_number = pin["issue_number"]
     if issue_number is None:
         issue_number = gh.create_issue(
@@ -100,14 +122,21 @@ def launch(conn, pin) -> None:
             ),
             labels=["pin-audit"],
         )
-        conn.execute("UPDATE pins SET issue_number = ? WHERE id = ?", (issue_number, pin["id"]))
+        store.save_claim_issue(claim_token, issue_number)
     session = devin.create_session(
         prompt=prompts.classification_prompt(pin["dependency"], pin["reason"], issue_number),
         title=f"pin-audit: {pin['dependency']}",
         tags=["graveyard-shift", pin["dependency"]],
         structured_output_schema=prompts.CLASSIFICATION_SCHEMA,
     )
-    store.create_run(conn, pin["id"], session["session_id"], session["url"])
+    try:
+        store.finish_claim(claim_token, session["session_id"], session["url"])
+    except Exception:
+        try:
+            devin.stop_session(session["session_id"])
+        except Exception:
+            logger.exception("failed to stop untracked Devin session %s", session["session_id"])
+        raise
     logger.info("launched %s for %s", session["session_id"], pin["dependency"])
 
 
@@ -159,7 +188,7 @@ def step_classifying(conn, run, pin, session) -> None:
 
     if classification in ("fixable_here", "stale_pin") and confidence >= config.CONFIDENCE_THRESHOLD:
         devin.send_message(run["session_id"], prompts.remediation_message(
-            pin["dependency"], pin["issue_number"], output.get("proposed_validation", ""),
+            pin["dependency"], pin["issue_number"],
         ))
         store.transition(conn, run, store.REMEDIATING, classification, **fields)
         gh.set_labels(pin["issue_number"], ["pin-audit", classification.replace("_", "-")])
@@ -172,6 +201,8 @@ def step_classifying(conn, run, pin, session) -> None:
         already_true, why = watches.is_unblocked(watch)
         if already_true:
             watch = {"kind": "none", "note": f"condition already met at classification ({why})"}
+        if not stop_or_escalate(conn, run, pin):
+            return
         conn.execute(
             "UPDATE pins SET due_at = ?, watch = ? WHERE id = ?",
             (time.time() + config.RECHECK_DAYS * 86400, json.dumps(watch), pin["id"]),
@@ -195,7 +226,12 @@ def step_remediating(conn, run, pin, session) -> None:
     only a commit newer than the one we failed does."""
     prs = session.get("pull_requests") or []
     if prs:
-        pr_url = prs[-1]["pr_url"]
+        try:
+            pr_url = prs[-1]["pr_url"]
+            gh.pr_number(pr_url)
+        except (KeyError, TypeError, ValueError):
+            escalate(conn, run, pin, "Devin returned an invalid pull request")
+            return
         if pr_url != run["pr_url"]:
             store.transition(conn, run, store.AWAITING_CI, pr_url, pr_url=pr_url)
             gh.comment(pin["issue_number"], f"Devin opened {pr_url}. Watching CI.")
@@ -235,6 +271,8 @@ def step_awaiting_ci(conn, run, pin, session) -> None:
         # again would burn the retry budget on a verdict we have already used.
         return
     if checks["conclusion"] == "success":
+        if not stop_or_escalate(conn, run, pin):
+            return
         store.transition(conn, run, store.GREEN, run["pr_url"])
         elapsed = int(time.time() - run["created_at"])
         gh.comment(pin["issue_number"],
@@ -252,9 +290,61 @@ def step_awaiting_ci(conn, run, pin, session) -> None:
         escalate(conn, run, pin, "CI still failing after retry")
 
 
-def escalate(conn, run, pin, reason: str, extra_fields: dict | None = None) -> None:
+def stop_or_escalate(conn, run, pin) -> bool:
+    """Stop the remote session before recording an unattended terminal state.
+
+    An abandoned session keeps working: one of them opened a pull request long
+    after this controller had stopped tracking it, so `green` and
+    `blocked_upstream` may only be written once the session is verifiably
+    stopped. But refusing to record anything until then strands the run in an
+    ACTIVE state forever, holding a concurrency slot and re-attempting the same
+    failing call every tick. So the attempt is bounded, and exhausting it is
+    itself grounds for escalation, which frees the slot and tells a human that a
+    session may still be live.
+
+    Returns True when the caller may proceed to its terminal state.
+    """
+    try:
+        devin.stop_session(run["session_id"])
+        return True
+    except Exception as exc:
+        attempts = run["stop_attempts"] + 1
+        store.update_run(conn, run["id"], stop_attempts=attempts)
+        store.log(conn, run["id"], "stop_failed", f"attempt {attempts}: {exc}")
+        if attempts < config.STOP_ATTEMPT_LIMIT:
+            logger.warning("stop failed for run %s (attempt %s), retrying next tick",
+                           run["id"], attempts)
+            return False
+        escalate(conn, run, pin,
+                 f"could not confirm the Devin session stopped after {attempts} attempts",
+                 extra_fields=None, stop_verified=False)
+        return False
+
+
+def escalate(conn, run, pin, reason: str, extra_fields: dict | None = None, *,
+             stop_verified: bool | None = None) -> None:
+    """Hand a run to a human. Always reaches ESCALATED.
+
+    Escalation is the one terminal state that must never be blocked by a failing
+    stop, because it is the path every other failure falls back to. When the
+    session cannot be confirmed stopped, that becomes something the human is
+    told rather than a reason to strand the run.
+    """
+    if stop_verified is None:
+        try:
+            devin.stop_session(run["session_id"])
+            stop_verified = True
+        except Exception as exc:
+            store.log(conn, run["id"], "stop_failed", f"during escalation: {exc}")
+            logger.warning("escalating run %s without a confirmed stop: %s", run["id"], exc)
+            stop_verified = False
+    warning = "" if stop_verified else (
+        "\n\n:warning: This Devin session could not be confirmed stopped. It may "
+        "still be working, and an abandoned session can still open a pull "
+        "request. Check it and stop it manually."
+    )
     store.transition(conn, run, store.ESCALATED, reason, **(extra_fields or {}))
     gh.set_labels(pin["issue_number"], ["pin-audit", "needs-human"])
     gh.comment(pin["issue_number"],
                f"**Escalating to a human**: {reason}.\n\nSession (full context): "
-               f"{run['session_url']}")
+               f"{run['session_url']}{warning}")

@@ -1,7 +1,16 @@
 name: pin-audit-ci
 on:
   pull_request:
-    paths: ["superset-frontend/**"]
+    # dependabot.yml is here because removing a dead ignore entry is a real
+    # remediation that touches no source. Without it such a pull request gets
+    # no check run at all, which reads as "waiting for CI" forever rather than
+    # as "verified".
+    paths:
+      - "superset-frontend/**"
+      - ".github/dependabot.yml"
+
+permissions:
+  contents: read
 
 jobs:
   focused-tests:
@@ -10,23 +19,37 @@ jobs:
       run:
         working-directory: superset-frontend
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # actions/checkout v4.4.0
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # actions/setup-node v4.4.0
         with:
           node-version: "24"
       - run: npm ci
-      - name: Determine changed plugin/package dirs
-        id: changed
+      - name: Resolve test scope from the diff
+        id: scope
+        # Pathspecs resolve against the working directory, so this step has to
+        # run from the repository root. Run it from superset-frontend and it
+        # looks for superset-frontend/superset-frontend, matches nothing, and
+        # every PR quietly falls back to the smoke suite.
+        working-directory: ${{ github.workspace }}
         run: |
           base=$(git merge-base origin/${{ github.base_ref }} HEAD)
-          dirs=$(git diff --name-only "$base" HEAD -- 'superset-frontend/plugins/**' 'superset-frontend/packages/**' \
-            | awk -F/ '{print $2"/"$3}' | sort -u | tr '\n' ' ')
-          echo "dirs=$dirs" >> "$GITHUB_OUTPUT"
-      - name: Run tests for changed dirs (or the smoke suite)
+          # Plugins and packages keep their tests in a sibling directory, so
+          # widen those to the package root. Application code under src/ keeps
+          # tests next to the source, so its own directory is the right scope.
+          dirs=$(git diff --name-only "$base" HEAD -- 'superset-frontend/**' \
+            | sed 's|^superset-frontend/||' \
+            | awk -F/ '
+                $1 == "plugins" || $1 == "packages" { print $1"/"$2; next }
+                $1 == "src" { path = $0; sub(/\/[^\/]*$/, "", path); print path }
+              ' \
+            | sort -u | tr '\n' ' ')
+          # A dependency-only bump touches no source directory. The handlebars
+          # plugin is the designated smoke suite for that case.
+          echo "dirs=${dirs:-plugins/plugin-chart-handlebars}" >> "$GITHUB_OUTPUT"
+      - name: Report test scope
         run: |
-          dirs="${{ steps.changed.outputs.dirs }}"
-          # Dependency-only bumps touch no plugin dir; the handlebars plugin
-          # is the designated smoke suite for those.
-          npm run test -- ${dirs:-plugins/plugin-chart-handlebars}
+          echo "Running jest against: ${{ steps.scope.outputs.dirs }}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Run scoped tests
+        run: npm run test -- --passWithNoTests ${{ steps.scope.outputs.dirs }}

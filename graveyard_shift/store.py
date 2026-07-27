@@ -4,6 +4,7 @@ events are the append-only trail the dashboard reads."""
 import json
 import sqlite3
 import time
+import uuid
 from contextlib import contextmanager
 
 from . import config
@@ -48,6 +49,7 @@ CREATE TABLE IF NOT EXISTS runs (
     pr_url TEXT,
     judged_sha TEXT,
     attempts INTEGER NOT NULL DEFAULT 0,
+    stop_attempts INTEGER NOT NULL DEFAULT 0,
     acus REAL NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
@@ -59,7 +61,19 @@ CREATE TABLE IF NOT EXISTS events (
     kind TEXT NOT NULL,
     detail TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS admission_claims (
+    pin_id INTEGER PRIMARY KEY REFERENCES pins(id),
+    group_key TEXT NOT NULL UNIQUE,
+    token TEXT NOT NULL UNIQUE,
+    claimed_at REAL NOT NULL
+);
 """
+
+
+class AdmissionClaimLostError(RuntimeError):
+    def __init__(self, token: str) -> None:
+        self.token = token
+        super().__init__(f"admission claim {token} is no longer active")
 
 
 @contextmanager
@@ -72,8 +86,11 @@ def db():
         conn.execute("ALTER TABLE pins RENAME COLUMN recheck_after TO due_at")
     if "watch" not in cols:
         conn.execute("ALTER TABLE pins ADD COLUMN watch TEXT")
-    if "judged_sha" not in {row[1] for row in conn.execute("PRAGMA table_info(runs)")}:
+    run_cols = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+    if "judged_sha" not in run_cols:
         conn.execute("ALTER TABLE runs ADD COLUMN judged_sha TEXT")
+    if "stop_attempts" not in run_cols:
+        conn.execute("ALTER TABLE runs ADD COLUMN stop_attempts INTEGER NOT NULL DEFAULT 0")
     try:
         yield conn
         conn.commit()
@@ -111,6 +128,65 @@ def create_run(conn, pin_id: int, session_id: str, session_url: str) -> int:
     )
     log(conn, cursor.lastrowid, "run_created", session_url)
     return cursor.lastrowid
+
+
+def claim_pin(pin_id: int) -> str | None:
+    token = uuid.uuid4().hex
+    now = time.time()
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        # Claims never expire automatically: after a crash, remote creation may
+        # have succeeded even though no run was persisted. An operator must
+        # resolve that uncertainty before deleting the claim and retrying.
+        occupied = len(active_runs(conn)) + conn.execute(
+            "SELECT COUNT(*) FROM admission_claims"
+        ).fetchone()[0]
+        if occupied >= config.MAX_CONCURRENT_RUNS:
+            return None
+        pin = conn.execute("SELECT * FROM pins WHERE id = ?", (pin_id,)).fetchone()
+        if pin is None:
+            return None
+        key = group_key(pin)
+        if key in active_group_keys(conn):
+            return None
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO admission_claims"
+            " (pin_id, group_key, token, claimed_at) VALUES (?, ?, ?, ?)",
+            (pin_id, key, token, now),
+        )
+        return token if cursor.rowcount == 1 else None
+
+
+def save_claim_issue(token: str, issue_number: int) -> None:
+    with db() as conn:
+        conn.execute(
+            "UPDATE pins SET issue_number = ? WHERE id ="
+            " (SELECT pin_id FROM admission_claims WHERE token = ?)",
+            (issue_number, token),
+        )
+
+
+def finish_claim(token: str, session_id: str, session_url: str) -> int:
+    with db() as conn:
+        claim = conn.execute(
+            "SELECT pin_id FROM admission_claims WHERE token = ?", (token,)
+        ).fetchone()
+        if claim is None:
+            raise AdmissionClaimLostError(token)
+        run_id = create_run(conn, claim["pin_id"], session_id, session_url)
+        conn.execute("DELETE FROM admission_claims WHERE token = ?", (token,))
+        return run_id
+
+
+def release_claim(token: str, detail: str) -> None:
+    with db() as conn:
+        claim = conn.execute(
+            "SELECT pin_id FROM admission_claims WHERE token = ?", (token,)
+        ).fetchone()
+        if claim is None:
+            return
+        conn.execute("DELETE FROM admission_claims WHERE token = ?", (token,))
+        log(conn, None, "launch_failed", detail)
 
 
 def transition(conn, run: sqlite3.Row, new_state: str, detail: str = "", **fields) -> None:
@@ -194,10 +270,18 @@ LATEST_RUNS = """SELECT * FROM runs r WHERE r.id = (
 )"""
 
 
-def _elapsed_to(conn, kind: str) -> list[float]:
-    """Seconds from a run's creation to the first time it reached a state."""
+def _elapsed_to(conn, kind: str, aggregate: str = "MIN") -> list[float]:
+    """Seconds from a run's creation to when it reached a state.
+
+    MIN answers "when did this first happen", which is what trigger-to-PR means.
+    Settling on a verdict is a different question: a run that recorded green more
+    than once had not actually finished the first time, so measuring from MIN
+    would report the earliest claim rather than the one that held.
+    """
+    if aggregate not in ("MIN", "MAX"):
+        raise ValueError(f"unsupported aggregate {aggregate!r}")
     rows = conn.execute(
-        f"SELECT r.created_at, MIN(e.at) FROM ({LATEST_RUNS}) r"
+        f"SELECT r.created_at, {aggregate}(e.at) FROM ({LATEST_RUNS}) r"
         " JOIN events e ON e.run_id = r.id WHERE e.kind = ? GROUP BY r.id",
         (kind,),
     ).fetchall()
@@ -215,14 +299,32 @@ def metrics(conn) -> dict:
     actionable = count("classification IN ('fixable_here', 'stale_pin')")
     greens = by_state.get(GREEN, 0)
     first_pass = count(f"state = '{GREEN}' AND attempts = 0")
+    claim_count, oldest_claimed_at = conn.execute(
+        "SELECT COUNT(*), MIN(claimed_at) FROM admission_claims"
+    ).fetchone()
     return {
         "pins_tracked": conn.execute("SELECT COUNT(*) FROM pins").fetchone()[0],
         "audits_completed": audited,
         "actionable_rate": round(actionable / audited, 2) if audited else None,
         "green_prs": greens,
-        "first_pass_ci": f"{first_pass}/{greens}" if greens else None,
+        # Throughput, which is the question a team actually asks of an
+        # autonomous system: how long until this hands me something reviewable,
+        # and how often does it get there without a second attempt.
+        #
+        # The name says "repair round" rather than "first-pass CI" because that
+        # is all `attempts` counts: a CI failure fed back to Devin. It cannot see
+        # a check run that passed while testing the wrong paths, so calling it a
+        # first-pass rate would claim more than the data supports.
+        "green_without_repair_round": f"{first_pass}/{greens}" if greens else None,
         "median_trigger_to_pr_s": _median(_elapsed_to(conn, f"state:{AWAITING_CI}")),
-        "median_trigger_to_green_s": _median(_elapsed_to(conn, f"state:{GREEN}")),
+        "median_trigger_to_green_s": _median(
+            _elapsed_to(conn, f"state:{GREEN}", aggregate="MAX")
+        ),
+        "admission_claims_in_flight": claim_count,
+        "oldest_admission_claim_age_s": (
+            round(max(0, time.time() - oldest_claimed_at))
+            if oldest_claimed_at is not None else None
+        ),
         "ci_retries": conn.execute(
             f"SELECT COALESCE(SUM(attempts), 0) FROM ({LATEST_RUNS})").fetchone()[0],
         "human_escalations": by_state.get(ESCALATED, 0),

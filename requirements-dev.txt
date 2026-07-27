@@ -1,0 +1,4 @@
+# Test-only dependencies. Kept out of requirements.txt so the runtime image
+# stays to what the orchestrator actually needs to run.
+-r requirements.txt
+pytest==9.1.1

@@ -2,6 +2,7 @@
 
 import base64
 import subprocess
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -69,8 +70,35 @@ def set_labels(issue_number: int, labels: list[str]) -> None:
     _request("PUT", f"/repos/{config.FORK}/issues/{issue_number}/labels", {"labels": labels})
 
 
+def pr_number(pr_url: str) -> int:
+    if not isinstance(pr_url, str):
+        raise ValueError("pull request URL must be a string")
+    try:
+        parsed = urlsplit(pr_url)
+        port = parsed.port
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid pull request URL") from exc
+    parts = parsed.path.rstrip("/").split("/")
+    expected_prefix = ["", *config.FORK.split("/"), "pull"]
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "github.com"
+        or port is not None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or len(parts) != 5
+        or parts[:4] != expected_prefix
+        or not parts[4].isdigit()
+        or int(parts[4]) < 1
+    ):
+        raise ValueError(f"pull request URL is not in configured fork {config.FORK}")
+    return int(parts[4])
+
+
 def pr_head_sha(pr_url: str) -> str:
-    number = int(pr_url.rstrip("/").split("/")[-1])
+    number = pr_number(pr_url)
     return _request("GET", f"/repos/{config.FORK}/pulls/{number}")["head"]["sha"]
 
 
@@ -79,7 +107,7 @@ def pr_checks(pr_url: str) -> dict:
     {conclusion, head_sha, failures: [...]}. conclusion is 'pending' |
     'success' | 'failure'. The head SHA matters: a verdict belongs to the
     commit it was computed from, not to the pull request."""
-    number = int(pr_url.rstrip("/").split("/")[-1])
+    number = pr_number(pr_url)
     pr = _request("GET", f"/repos/{config.FORK}/pulls/{number}")
     head_sha = pr["head"]["sha"]
     checks = _request(

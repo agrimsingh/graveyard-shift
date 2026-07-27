@@ -22,7 +22,7 @@ sys.path[:0] = [str(HERE.parent), str(HERE)]
 
 import httpx  # noqa: E402
 
-from graveyard_shift import config, store  # noqa: E402
+from graveyard_shift import config, devin, store  # noqa: E402
 
 import service  # noqa: E402
 
@@ -37,6 +37,8 @@ EXPECTED_BY_STATE = {store.GREEN: 5, store.BLOCKED_UPSTREAM: 3, store.ESCALATED:
 
 # Long enough that the scheduled reconciler will not fire during a recording.
 QUIET_TICK_SECONDS = 86_400
+TERMINATION_TIMEOUT_SECONDS = 15
+TERMINATION_POLL_SECONDS = 0.5
 
 TABS = [
     ("dashboard", service.DASHBOARD),
@@ -46,7 +48,7 @@ TABS = [
      f"https://github.com/{config.FORK}/blob/{config.DEFAULT_BRANCH}"
      "/.github/dependabot.yml#L12-L43"),
     ("PR #4 diff", f"https://github.com/{config.FORK}/pull/4/files"),
-    ("issue #7, the react escalation", f"https://github.com/{config.FORK}/issues/7"),
+    ("PR #17, the React migration", f"https://github.com/{config.FORK}/pull/17"),
 ]
 
 
@@ -64,7 +66,7 @@ def discard_rehearsal_run(conn) -> str | None:
     """
     pin = conn.execute("SELECT * FROM pins WHERE dependency = ?", (DEMO_PIN,)).fetchone()
     if pin is None:
-        raise NotReady(f"no pin named {DEMO_PIN!r} in {config.DB_PATH}")
+        return None
 
     runs = conn.execute(
         "SELECT * FROM runs WHERE pin_id = ? ORDER BY id", (pin["id"],)
@@ -76,18 +78,114 @@ def discard_rehearsal_run(conn) -> str | None:
     if not extras:
         return None
 
+    terminated = []
+    for run in extras:
+        session_id = run["session_id"]
+        try:
+            before = devin.get_session(session_id)
+        except httpx.HTTPError as exc:
+            raise NotReady(
+                f"could not inspect rehearsal session {session_id!r}; "
+                "tracking was kept"
+            ) from exc
+        if before.get("session_id") != session_id:
+            raise NotReady(
+                f"rehearsal session identity mismatch for {session_id!r}; "
+                "tracking was kept and no session was terminated"
+            )
+        try:
+            if devin.is_stopped(before):
+                continue
+        except KeyError as exc:
+            raise NotReady(
+                f"rehearsal session {session_id!r} returned no status; "
+                "tracking was kept"
+            ) from exc
+        try:
+            devin.terminate_session(session_id)
+        except httpx.HTTPError as exc:
+            raise NotReady(
+                f"could not terminate and verify rehearsal session {session_id!r}; "
+                "tracking was kept"
+            ) from exc
+
+        deadline = time.monotonic() + TERMINATION_TIMEOUT_SECONDS
+        while True:
+            try:
+                after = devin.get_session(session_id)
+            except httpx.HTTPError as exc:
+                raise NotReady(
+                    f"could not verify terminated rehearsal session {session_id!r}; "
+                    "tracking was kept"
+                ) from exc
+            if after.get("session_id") != session_id:
+                raise NotReady(
+                    f"rehearsal session identity mismatch after terminating "
+                    f"{session_id!r}; tracking was kept"
+                )
+            try:
+                if devin.is_stopped(after):
+                    break
+            except KeyError as exc:
+                raise NotReady(
+                    f"rehearsal session {session_id!r} returned no termination status; "
+                    "tracking was kept"
+                ) from exc
+            if time.monotonic() >= deadline:
+                raise NotReady(
+                    f"rehearsal session {session_id!r} did not stop within "
+                    f"{TERMINATION_TIMEOUT_SECONDS}s; tracking was kept"
+                )
+            time.sleep(TERMINATION_POLL_SECONDS)
+        terminated.append(session_id)
+
     for run in extras:
         conn.execute("DELETE FROM events WHERE run_id = ?", (run["id"],))
         conn.execute("DELETE FROM runs WHERE id = ?", (run["id"],))
     detail = ", ".join(
-        f"{run['session_url']}{' (still working)' if run['state'] in store.ACTIVE else ''}"
+        f"{run['session_url']}{' (terminated)' if run['session_id'] in terminated else ''}"
         for run in extras
     )
     return (f"rolled {DEMO_PIN} back to its green run, discarding "
-            f"{len(extras)} rehearsal run(s). Devin is not interrupted: {detail}")
+            f"{len(extras)} rehearsal run(s): {detail}")
+
+
+def check_no_claims(conn) -> None:
+    """Refuse if any admission claim is outstanding.
+
+    A claim outlives the process that made it and never expires, so a launch
+    interrupted by the SIGTERM this script itself sends leaves a row that
+    silently consumes a concurrency slot. At the demo's limit of one that makes
+    every tick a no-op, which looks exactly like a dead trigger. Checking once up
+    front is not enough for the same reason: the window this guards against is
+    opened by our own restart, so it has to be re-checked after it.
+    """
+    claims = conn.execute(
+        "SELECT c.token, c.claimed_at, p.dependency FROM admission_claims c"
+        " JOIN pins p ON p.id = c.pin_id ORDER BY c.claimed_at"
+    ).fetchall()
+    if not claims:
+        return
+    held = "\n".join(
+        f"      {row['dependency']}, claimed {int(time.time() - row['claimed_at'])}s ago"
+        f"\n        sqlite3 {config.DB_PATH} \"DELETE FROM admission_claims"
+        f" WHERE token = '{row['token']}'\""
+        for row in claims
+    )
+    raise NotReady(
+        f"{len(claims)} unresolved admission claim(s) are holding concurrency slots. "
+        "Each means a launch was interrupted after claiming a pin, so a Devin "
+        "session may exist with no run tracking it. For each one, find the "
+        "untracked session for that pin at https://app.devin.ai/sessions and stop "
+        "it, then run the matching delete. Delete only the claim you resolved: "
+        "clearing the table would release claims whose sessions are still "
+        f"unaccounted for, and those pins would be launched a second time.\n\n{held}"
+    )
 
 
 def check_converged(conn) -> None:
+    check_no_claims(conn)
+
     active = store.active_runs(conn)
     if active:
         names = ", ".join(
@@ -140,6 +238,12 @@ def check_tabs() -> None:
 
 
 def preflight() -> None:
+    if not config.CONTROL_TOKEN:
+        raise NotReady(
+            "GS_CONTROL_TOKEN is unset; set it before preparing the authenticated "
+            "on-camera tick"
+        )
+
     notes = []
 
     with store.db() as conn:
@@ -152,6 +256,11 @@ def preflight() -> None:
         set_demo_pin_due(conn, None)
 
     notes.append(service.stop())
+    # Between the check above and that SIGTERM, the old process was still
+    # reconciling and could have claimed a pin. Catch it now, while the failure
+    # is still attributable to this restart.
+    with store.db() as conn:
+        check_no_claims(conn)
     pid = service.start({
         # Scoped so the tick triggered on camera starts exactly one session.
         "GS_PIN_ALLOWLIST": DEMO_PIN,
@@ -167,11 +276,25 @@ def preflight() -> None:
     # Arm only after the startup pass has finished, or it claims the pin first
     # and the live trigger has nothing to do.
     service.wait_for_first_tick()
+
+    # Exercise the real on-camera command now, while the pin is still disarmed
+    # so a pass costs nothing. Discovering a rejected token mid-recording is the
+    # expensive way to learn the token only lives in .env.
+    try:
+        service.send_tick()
+    except Exception as exc:
+        raise NotReady(f"the authenticated tick used on camera does not work: {exc}") from exc
+    notes.append("authenticated tick verified against the running service")
+
     with store.db() as conn:
         set_demo_pin_due(conn, 0)
 
     # Prove the handover state is what it claims: armed, and nothing started.
+    # The claim check runs again here because the SIGTERM above is exactly what
+    # can strand a claim, and a claim stranded after the first check would
+    # otherwise reach READY as a silently dead trigger.
     with store.db() as conn:
+        check_no_claims(conn)
         if store.active_runs(conn):
             raise NotReady(
                 "a run started during preflight, so the live trigger would have "
@@ -191,7 +314,8 @@ def preflight() -> None:
        {summary['audits_completed']} audits, {summary['green_prs']} green PRs, """
           f"""{summary['runs_by_state'].get(store.BLOCKED_UPSTREAM, 0)} upstream blocks, """
           f"""{summary['runs_by_state'].get(store.ESCALATED, 0)} escalations
-    2. curl -X POST {service.DASHBOARD}/api/tick
+    2. make tick
+       (reads the token from .env, so nothing secret appears on screen)
     3. refresh the dashboard, open the new Devin session, leave it working
 
   Afterwards: .venv/bin/python scripts/demo_preflight.py --stop""")

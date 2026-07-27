@@ -43,10 +43,10 @@ Ten pins in the ignore list, every one audited:
 | `jest-environment-jsdom` | `stale_pin` | [PR #6](https://github.com/agrimsingh/superset/pull/6), green |
 | `react-icons` | `stale_pin` | [PR #12](https://github.com/agrimsingh/superset/pull/12), green |
 | `@swc/plugin-transform-imports` | `stale_pin` | [PR #15](https://github.com/agrimsingh/superset/pull/15), green |
-| `react` | `fixable_here` | [PR #14](https://github.com/agrimsingh/superset/pull/14), a 6,812 line React 18→19 migration, escalated after its repair round |
+| `react` | `fixable_here` | [PR #14](https://github.com/agrimsingh/superset/pull/14), escalated after its repair round |
 | `@types/react` | `blocked_upstream` | parked, watching [apache/superset#42112](https://github.com/apache/superset/pull/42112) |
 | `@types/react-dom` | `blocked_upstream` | parked behind the same migration |
-| `react-dom` | escalated | duplicate of the React 19 work already in flight |
+| `react-dom` | escalated locally | its remote session later opened follow-up [PR #17](https://github.com/agrimsingh/superset/pull/17) |
 | `@babel/*` | `blocked_upstream` | parked behind the Babel 8 ecosystem |
 
 Three verdicts, and the interesting thing is that they are interesting in
@@ -150,8 +150,11 @@ answer in a machine-readable shape and then read what it could not express.
 
 Superset's ignore list has five React entries under a single TODO. They are one
 migration, and the controller originally audited them as five independent
-pins — so `react` opened a 6,812 line upgrade while `react-dom` started a
-second session on the same work.
+pins, so `react` and `react-dom` started separate sessions on the same work.
+The current follow-up is
+[PR #17](https://github.com/agrimsingh/superset/pull/17): a React 18→19
+migration spanning 187 files, with 6,875 additions and 6,571 deletions,
+roughly 13,400 changed lines.
 
 Devin had already worked this out. Its own summary for `react-dom` said the
 package "cannot be bumped independently of react/@types/react". The agent knew
@@ -161,8 +164,9 @@ model it was reporting into.
 
 A Dependabot author writes one comment above the block of entries that move
 together, so the comment is the grouping signal, and admission now runs at most
-one member of a group at a time. Full group-level remediation — one branch that
-clears all five entries — is the obvious next step and is not built.
+one member of a group at a time. Full group-level remediation, where one run
+owns the whole comment block and reconciles every member into one branch, is
+still not built.
 
 ## How it works
 
@@ -224,10 +228,11 @@ acted on. This is the bug that a naive fake hides, which is why the simulation's
 CI is keyed to a head SHA that only advances when something is pushed.
 
 **The reconciler is idempotent.** Every tick reads the world and advances each
-run by at most one step, so a crash mid-tick loses nothing. Admission consumes
-a pin's due date at launch, which is what stops a due pin from starting a fresh
-session on every pass. `scripts/verify_convergence.py` covers all six admission
-paths.
+run by at most one step. Admission writes a durable claim before launching a
+session, which stops concurrent ticks from spending twice on the same pin or
+group. Claims deliberately do not expire automatically after a crash; the
+operator recovery tradeoff is covered below. `scripts/verify_convergence.py`
+covers all six admission paths.
 
 **Parked pins carry a watch, not a timer.** A blind re-audit schedule burns
 budget on pins where nothing changed. Instead Devin states the condition that
@@ -250,22 +255,66 @@ automatic merging. A human always approves the diff.
 
 ## Running it
 
-Requires a Devin service user key (`cog_`) and its organization ID, plus a
-GitHub token with access to your fork.
+Create the local environment first:
 
 ```bash
-cp .env.example .env      # then fill in the three values
+make setup
+cp .env.example .env
+```
+
+The live controller requires a Devin service user key (`cog_`), its
+organization ID, a GitHub token with access to your fork, and a random bearer
+token for manual control:
+
+```bash
+# Fill these in .env; do not commit it.
+DEVIN_API_KEY=cog_...
+DEVIN_ORG_ID=org-...
+GITHUB_TOKEN=...
+GS_CONTROL_TOKEN=...
+GS_FORK=you/superset
+GS_ALLOWED_FORKS=you/superset
+
 docker compose up --build
 ```
 
-The dashboard is at http://localhost:8090. It reconciles every 60 seconds, and
-`POST /api/tick` forces one immediately. `GET /api/health` reports completed
-reconciliation passes, which is the only way to see that the reconciler is alive
-once the audit has converged and stopped writing anything.
+`GS_FORK` must be present in the comma-separated `GS_ALLOWED_FORKS`; startup
+fails before any GitHub or Devin work when it is not. Use `openssl rand -hex
+32` to generate the control token.
 
-Prepare a fork before the first run. This installs a focused CI workflow and
-disables the roughly thirty-five inherited Superset workflows, so that "green"
-means one relevant test suite passed rather than a full release matrix:
+The dashboard is at http://localhost:8090. It binds loopback by default and
+Docker publishes it only on `127.0.0.1`, because the read routes are
+unauthenticated and disclose the fork under audit, the pins in flight, and live
+Devin session URLs. `GS_BIND=0.0.0.0` exposes it to the network, which is what
+the container sets internally so the published loopback port can reach it. It
+reconciles every 60 seconds. The manual trigger requires the bearer token:
+
+```bash
+make tick    # reads GS_CONTROL_TOKEN from .env
+
+# or, if the token is exported in your shell:
+curl -fsS -X POST \
+  -H "Authorization: Bearer $GS_CONTROL_TOKEN" \
+  http://localhost:8090/api/tick
+```
+
+Prefer `make tick`. `.env` is read by this project's Python, not by your shell,
+so the `curl` form sends an empty token and gets a 401 unless you exported the
+variable yourself.
+
+`GITHUB_TOKEN` is optional locally, where it falls back to `gh auth token`, but
+required under Docker, because the image does not ship the `gh` CLI.
+
+`POST /api/tick` returns `503` when `GS_CONTROL_TOKEN` is unset, `401` for a
+missing or incorrect bearer token, and `502` if that reconciliation pass
+records an upstream failure. `GET /api/health` reports completed passes, the
+current pass timestamps, and the most recent reconciliation error, which is
+how to distinguish an idle converged controller from a dead one.
+
+Prepare a fork before the first run. This limits Actions to full-SHA-pinned
+GitHub-owned actions, installs the focused CI workflow, and disables the
+roughly thirty-five inherited Superset workflows, so that "green" means one
+relevant test suite passed rather than a full release matrix:
 
 ```bash
 GS_FORK=you/superset ./scripts/setup_fork_ci.sh
@@ -295,8 +344,20 @@ model failures that a friendlier fake hid for most of this project.
 make verify       # or: .venv/bin/python scripts/verify_convergence.py
 ```
 
-Proves admission converges: eight seeded situations, each asserting the exact
-number of Devin sessions a repeated tick may start.
+Proves admission converges: nine seeded situations, each asserting the exact
+number of Devin sessions a repeated tick may start. Two of them guard spend
+directly, since deleting either the concurrency cap or the shared-justification
+guard is otherwise invisible: pins sharing one Dependabot comment must run one
+at a time, and a graveyard that all comes due at once must not open a session
+per pin.
+
+```bash
+make test         # unit and integration tests
+make check        # test, verify and simulate together
+```
+
+Run `make check` before committing. The three layers catch different things, and
+each one has caught a regression the others missed.
 
 ## Knowing whether it works
 
@@ -307,11 +368,13 @@ The dashboard answers the question an engineering leader actually asks.
 | `audits_completed` | How much of the graveyard has been re-examined |
 | `actionable_rate` | Share of pins that were not really blocked |
 | `green_prs` | Review-ready output |
-| `first_pass_ci` | How often Devin gets it right without a repair round |
-| `median_trigger_to_pr_s` | Detection to proposed fix |
-| `median_trigger_to_green_s` | Detection to passing CI |
 | `ci_retries` | Repair rounds consumed |
 | `human_escalations` | Where the system knew to stop |
+| `median_trigger_to_pr_s` | How long until there is something to review |
+| `median_trigger_to_green_s` | How long until that something passes its tests |
+| `green_without_repair_round` | How often it gets there without a CI failure fed back |
+| `admission_claims_in_flight` | Claims currently blocking duplicate admission |
+| `oldest_admission_claim_age_s` | How long the oldest claim has blocked work |
 
 A pin can be audited more than once, when a watch fires or the question
 improves. Every metric reports the most recent run per pin, so the dashboard
@@ -319,38 +382,97 @@ answers "where does this pin stand now" rather than "how many attempts have
 there been". Superseded runs stay in the feed. Every run links to its Devin
 session, so any number can be traced to the work that produced it.
 
-Final state of the Superset fork: 10 pins tracked and audited, 5 green PRs, 5/5
-first-pass CI on those, median 10m 29s trigger to PR and 14m 49s trigger to
-green, 1 CI repair round, 2 escalations, nothing left running.
+The recorded controller snapshot has 10 pins audited, five scoped-suite-green
+pull requests, three pins parked upstream, and two local escalations. Median
+10m 29s from trigger to an open pull request, 24m 49s from trigger to green, and
+5 of 5 of those greens with no CI failure ever fed back to Devin.
 
-The escalations are the interesting number. A system that never escalates is
-not being careful, it is being lucky.
+That last number is deliberately not called a first-pass CI rate. `attempts`
+counts repair rounds this controller drove, and two of the five greens needed a
+human before their tests were genuinely exercised — in both cases because the
+CI harness here was wrong, not because Devin's diff was:
 
-One is `react-dom`, stopped because the React 19 migration it wanted to perform
-was already in flight on another pin's branch. The other is `react` itself, and
-its event trail is the whole design in six lines:
+- **PR #4** passed on Devin's commit at 08:22:43 while the workflow's scope
+  resolver silently fell back to an unrelated smoke suite, so the 21 tests that
+  mattered had not run. Two empty commits re-triggered CI once the resolver was
+  fixed, and the correctly scoped `filterscope` suite passed at 08:32:35 against
+  Devin's unchanged code.
+- **PR #6** produced no check run at all, because a `dependabot.yml`-only
+  remediation fell outside the workflow's path filter. An empty commit
+  re-triggered CI after the filter was widened.
+
+Three of the five — PRs #3, #12 and #15 — went green unattended on Devin's own
+commit with no human touch.
+
+PR #4 is also why trigger-to-green measures a run's *last* recorded green rather
+than its first: a run that recorded green twice had not finished the first time,
+and reporting the earlier claim would have understated that run by ten minutes.
+Latency is measurable rather than estimated because a terminal state requires a
+verified remote stop — `green` is written only after the Devin session is
+confirmed exited, so the interval has a real end rather than the moment this
+controller stopped paying attention. These are operational latencies for this
+fork's scoped suites, not a benchmark of Devin.
+
+The `react` escalation shows the feedback boundary:
 
 ```
 17:29  run created
 17:34  classified fixable_here
-18:20  opened PR #14, 6,812 lines
+18:20  opened PR #14
 18:42  CI failed, failure logs sent back into the same session
 18:46  Devin pushed a repair commit
 19:04  still failing, escalated to a human
 ```
 
-It tried the largest thing in the graveyard, got one repair round, and then
-stopped and handed a human the branch plus the full session history. That is
-the correct outcome for a React 18 to 19 migration, and it is worth more than a
-sixth green PR would have been.
+Before remote termination was enforced, the controller stopped advancing that
+run after one repair round and handed a human the branch plus the full session
+history. A separate `react-dom` session was marked escalated locally, continued
+remotely, and opened PR #17 later, while the historical dashboard row remained
+escalated without its PR.
+
+Terminal transitions now stop that failure mode. Before committing `green` or
+`blocked_upstream`, the controller deletes the tracked Devin session and fetches
+it again; only an exact remote `status == "exit"` permits the local transition.
+A failed delete, failed verification, or non-exited session leaves the run
+active so the next tick retries instead of orphaning remote work.
+
+That retry is bounded by `GS_STOP_ATTEMPTS`, because the alternative to
+orphaning remote work is stranding local work: a run that can never confirm a
+stop would hold its concurrency slot and re-attempt the same failing call on
+every tick forever. Exhausting the attempts is itself grounds for escalation.
+Escalation is the one terminal state that never waits on a stop, since it is
+what every other failure path falls back to; when it cannot confirm the session
+exited it says so on the issue, so the human is told a session may still be
+running rather than being told nothing.
 
 ### Honest caveats
 
+**Admission claims fail closed.** If the process is killed after writing an
+`admission_claims` row, that row continues to block the pin and its group; it
+does not time out or recover automatically. This trades automatic availability
+for protection against launching a duplicate Devin session and paying for the
+same work twice. The cost is that a claim silently consumes a concurrency slot,
+which at a limit of one looks exactly like a dead trigger, so it is surfaced
+three ways: `admission_claims_in_flight` and `oldest_admission_claim_age_s` on
+the dashboard, and `make demo-ready` refuses to hand over a machine that holds
+any claim. Clearing one is deliberately manual, because the row means a Devin
+session may exist with no run tracking it:
+
+```bash
+sqlite3 graveyard.sqlite3 'SELECT * FROM admission_claims'
+# find the untracked session for that pin at https://app.devin.ai/sessions,
+# stop it, then release that one claim by its token:
+sqlite3 graveyard.sqlite3 "DELETE FROM admission_claims WHERE token = '<token>'"
+```
+
+Release claims one at a time, by token. Clearing the table would also release
+claims whose sessions are still unaccounted for, and those pins would then be
+launched a second time — which is the duplicate spend the claim exists to
+prevent.
+
 **Cost per fix is not reported.** The account used here reports zero ACU
 consumption at both the session and organization level, so any cost-per-fix
-number would be fabricated. Consumption is still recorded per run and the
-figure becomes meaningful on a metered account. Until then wall-clock time to
-green is the defensible signal.
+number would be fabricated. Wall-clock latency is reported instead.
 
 **The repair loop was broken until the fake stopped flattering it.** For most
 of this project CI passed first time on every PR, so the feedback path never
@@ -377,11 +499,16 @@ resolved its diff from the wrong working directory, so its pathspec matched
 nothing and every PR silently fell back to a smoke suite that did not cover the
 changed code. PR #4 was reporting green on tests unrelated to its own diff. I
 fixed the workflow and pushed empty commits to re-trigger CI against the real
-scope. No source was changed, and `first_pass_ci` counts Devin repair rounds, of
-which there were none.
+scope. No source was changed, which is why a green check without an inspected
+scope is not evidence that the changed code was tested.
 
-**Two pins, deliberately.** The remaining eight are tracked and classifiable,
-but the point was to prove the loop end to end rather than to maximise a funnel.
+**Demo cleanup is local and remote.** `make demo-stop` stops only the recorded
+local orchestrator process, then inspects any rehearsal Devin session before
+removing its local rows. If a remote session is still active, cleanup
+terminates it and verifies that it stopped; if inspection or termination
+cannot be verified, cleanup refuses to delete the tracking data. This matters
+because PR #17 proved that remote work can continue after a local run is
+terminal.
 
 ## Layout
 
@@ -396,6 +523,8 @@ but the point was to prove the loop end to end rather than to maximise a funnel.
 | `graveyard_shift/web.py` | Dashboard and JSON API |
 | `scripts/simulate.py` | Full workflow replay, no credentials needed |
 | `scripts/verify_convergence.py` | Regression cover for admission |
+| `tests/` | Unit and integration tests, run by `make test` |
 | `scripts/setup_fork_ci.sh` | Fork preparation |
 | `scripts/service.py` | Start/stop the orchestrator through a PID file |
+| `scripts/tick.py` | Authenticated manual trigger, reading the token from `.env` |
 | `spike/spike.py` | Environment check against a live Devin session |
