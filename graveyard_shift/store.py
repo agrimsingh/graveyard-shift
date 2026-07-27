@@ -116,15 +116,26 @@ def upsert_pin(conn, dependency: str, directory: str, reason: str, entry_hash: s
     return conn.execute("SELECT * FROM pins WHERE dependency = ?", (dependency,)).fetchone()
 
 
-def create_run(conn, pin_id: int, session_id: str, session_url: str) -> int:
+def create_run(
+    conn,
+    pin_id: int,
+    session_id: str,
+    session_url: str,
+    created_at: float | None = None,
+) -> int:
     now = time.time()
+    # The run row is only written once the issue and the Devin session exist, so
+    # stamping it with `now` would start the clock after work already began and
+    # quietly exclude that setup from every latency metric. Callers that admitted
+    # the pin pass the moment they claimed it, which is when the trigger acted.
+    created_at = now if created_at is None else created_at
     # Launching consumes the due date. Without this a pin whose due date has
     # passed is re-admitted on every tick, one Devin session per pass.
     conn.execute("UPDATE pins SET due_at = NULL WHERE id = ?", (pin_id,))
     cursor = conn.execute(
         "INSERT INTO runs (pin_id, session_id, session_url, state, created_at, updated_at)"
         " VALUES (?, ?, ?, ?, ?, ?)",
-        (pin_id, session_id, session_url, CLASSIFYING, now, now),
+        (pin_id, session_id, session_url, CLASSIFYING, created_at, now),
     )
     log(conn, cursor.lastrowid, "run_created", session_url)
     return cursor.lastrowid
@@ -169,11 +180,17 @@ def save_claim_issue(token: str, issue_number: int) -> None:
 def finish_claim(token: str, session_id: str, session_url: str) -> int:
     with db() as conn:
         claim = conn.execute(
-            "SELECT pin_id FROM admission_claims WHERE token = ?", (token,)
+            "SELECT pin_id, claimed_at FROM admission_claims WHERE token = ?", (token,)
         ).fetchone()
         if claim is None:
             raise AdmissionClaimLostError(token)
-        run_id = create_run(conn, claim["pin_id"], session_id, session_url)
+        run_id = create_run(
+            conn,
+            claim["pin_id"],
+            session_id,
+            session_url,
+            created_at=claim["claimed_at"],
+        )
         conn.execute("DELETE FROM admission_claims WHERE token = ?", (token,))
         return run_id
 

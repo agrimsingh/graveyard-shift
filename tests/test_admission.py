@@ -35,6 +35,35 @@ class AdmissionClaimTests(unittest.TestCase):
             self.assertEqual(1, metrics["admission_claims_in_flight"])
             self.assertEqual(60, metrics["oldest_admission_claim_age_s"])
 
+    def test_run_clock_starts_when_the_pin_was_admitted(self) -> None:
+        """The run row is written only after the issue and the Devin session
+        exist. Stamping it with the current time would start every latency
+        metric after work had already begun, so "trigger to pull request" would
+        silently exclude its own setup."""
+        # Given: a pin claimed at t=1000, whose remote setup took 30s.
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            config, "DB_PATH", Path(directory) / "state.db"
+        ):
+            with store.db() as conn:
+                pin = store.upsert_pin(conn, "package", "/", "reason", "hash")
+            with mock.patch.object(store.time, "time", return_value=1000):
+                token = store.claim_pin(pin["id"])
+
+            # When
+            with mock.patch.object(store.time, "time", return_value=1030):
+                run_id = store.finish_claim(token, "devin-1", "https://app.devin.ai/1")
+
+            # Then
+            with store.db() as conn:
+                run = conn.execute(
+                    "SELECT created_at, updated_at FROM runs WHERE id = ?", (run_id,)
+                ).fetchone()
+
+        self.assertEqual(1000, run["created_at"])
+        # State entry is still now: grace periods and timeouts measure time since
+        # the last state change, not since admission.
+        self.assertEqual(1030, run["updated_at"])
+
     def test_old_claim_remains_authoritative_until_explicit_recovery(self) -> None:
         # Given
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(

@@ -407,11 +407,20 @@ commit with no human touch.
 PR #4 is also why trigger-to-green measures a run's *last* recorded green rather
 than its first: a run that recorded green twice had not finished the first time,
 and reporting the earlier claim would have understated that run by ten minutes.
-Latency is measurable rather than estimated because a terminal state requires a
-verified remote stop — `green` is written only after the Devin session is
-confirmed exited, so the interval has a real end rather than the moment this
-controller stopped paying attention. These are operational latencies for this
-fork's scoped suites, not a benchmark of Devin.
+
+Both intervals start when the tick admitted the pin, not when the run row was
+written. The run row only exists once the tracking issue and the Devin session
+do, so stamping it on insert would have excluded that setup from every latency
+figure — the metric would have been named for the trigger while measuring from
+somewhere after it. It is timestamped from the claim instead. The runs in the
+snapshot above predate that and are each short by the 1.2–2.3s their remote
+setup took, which is under half a percent of either median.
+
+They end honestly too: a terminal state requires a verified remote stop, so
+`green` is written only after the Devin session is confirmed exited, and the
+interval has a real end rather than the moment this controller stopped paying
+attention. These are operational latencies for this fork's scoped suites, not a
+benchmark of Devin.
 
 The `react` escalation shows the feedback boundary:
 
