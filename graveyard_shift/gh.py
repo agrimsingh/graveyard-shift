@@ -86,7 +86,14 @@ def pr_checks(pr_url: str) -> dict:
         "GET", f"/repos/{config.FORK}/commits/{head_sha}/check-runs?per_page=100"
     )["check_runs"]
     if not checks or any(c["status"] != "completed" for c in checks):
-        return {"conclusion": "pending", "head_sha": head_sha, "failures": []}
+        # has_checks separates "no result yet" from "no workflow watches these
+        # paths, so no result is ever coming".
+        return {
+            "conclusion": "pending",
+            "head_sha": head_sha,
+            "has_checks": bool(checks),
+            "failures": [],
+        }
     failures = [
         {"name": c["name"], "url": c["html_url"], "summary": (c["output"]["summary"] or "")[:2000]}
         for c in checks
@@ -95,5 +102,6 @@ def pr_checks(pr_url: str) -> dict:
     return {
         "conclusion": "failure" if failures else "success",
         "head_sha": head_sha,
+        "has_checks": True,
         "failures": failures,
     }

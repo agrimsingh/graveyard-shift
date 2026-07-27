@@ -22,6 +22,7 @@ config.DB_PATH = Path(tempfile.mkdtemp()) / "simulate.sqlite3"
 config.PIN_ALLOWLIST = []
 config.MAX_CONCURRENT_RUNS = 10
 config.REMEDIATION_GRACE_SECONDS = 0
+config.CI_APPEAR_TIMEOUT_SECONDS = 0
 
 from graveyard_shift import controller, devin, gh, store  # noqa: E402
 
@@ -57,7 +58,18 @@ CLASSIFICATIONS = {
         "evidence": [{"summary": "no documented reason; cannot determine intent"}],
         "unblock_watch": {"kind": "none", "note": "unknown"},
     },
+    "config-only-pin": {
+        "classification": "stale_pin",
+        "confidence": 0.95,
+        "evidence": [{"summary": "the ignore entry guards a version that cannot occur"}],
+        "proposed_validation": "none; this deletes an ignore entry",
+        "unblock_watch": {"kind": "none", "note": "nothing to wait on"},
+    },
 }
+
+# A fix that only deletes an ignore entry touches no path a workflow watches,
+# so no check run is ever created for it.
+NO_CI_PR = "https://github.com/agrimsingh/superset/pull/43"
 
 
 class FakeDevin:
@@ -88,6 +100,11 @@ class FakeDevin:
         self.messages.append((session_id, message))
         session = self.sessions[session_id]
         if not session["pull_requests"]:
+            if session_id == "sim-config-only-pin":
+                session["pull_requests"] = [{"pr_url": NO_CI_PR, "pr_state": "open"}]
+                fake_gh.push(NO_CI_PR, passing=None)
+                print(f"    devin resumed, opened {NO_CI_PR} (config only, no CI will run)")
+                return session
             session["pull_requests"] = [{"pr_url": PR, "pr_state": "open"}]
             fake_gh.push(PR, passing=False)
             print(f"    devin resumed, opened {PR}")
@@ -145,11 +162,16 @@ class FakeGitHub:
 
     def pr_checks(self, pr_url):
         head, passing = self.heads[pr_url][-1]
+        if passing is None:
+            # No workflow watches the changed paths, so no check run exists.
+            return {"conclusion": "pending", "head_sha": head,
+                    "has_checks": False, "failures": []}
         if passing:
             print(f"    CI passed on {head}")
-            return {"conclusion": "success", "head_sha": head, "failures": []}
+            return {"conclusion": "success", "head_sha": head,
+                    "has_checks": True, "failures": []}
         print(f"    CI failed on {head}")
-        return {"conclusion": "failure", "head_sha": head, "failures": [{
+        return {"conclusion": "failure", "head_sha": head, "has_checks": True, "failures": [{
             "name": "focused-tests",
             "url": "https://github.com/agrimsingh/superset/actions/runs/1",
             "summary": "FAIL formatCurrencyHelper.test.ts: expected $1,234,567.89",
@@ -184,13 +206,23 @@ for key, value in summary.items():
         print(f"    {key:28s} {value}")
 
 feedback = [m for _, m in fake_devin.messages if "CI failed" in m]
+with store.db() as conn:
+    state_of = {
+        row["dependency"]: row["state"]
+        for row in conn.execute(
+            "SELECT p.dependency, r.state FROM runs r JOIN pins p ON p.id = r.pin_id"
+        )
+    }
 checks = {
     "one PR reached green": summary["green_prs"] == 1,
     "CI failure was fed back into the same session": len(feedback) == 1,
     "the repair took exactly one retry": summary["ci_retries"] == 1,
     "the upstream-blocked pin was parked, not escalated": summary["runs_by_state"].get(
         store.BLOCKED_UPSTREAM) == 1,
-    "the low-confidence pin went to a human": summary["human_escalations"] == 1,
+    "the low-confidence pin went to a human":
+        state_of.get("mystery-pin") == store.ESCALATED,
+    "a PR no workflow watches escalates instead of hanging":
+        state_of.get("config-only-pin") == store.ESCALATED,
 }
 print()
 for label, passed in checks.items():

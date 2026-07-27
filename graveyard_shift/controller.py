@@ -213,6 +213,15 @@ def step_remediating(conn, run, pin, session) -> None:
 def step_awaiting_ci(conn, run, pin, session) -> None:
     checks = gh.pr_checks(run["pr_url"])
     if checks["conclusion"] == "pending":
+        # A pull request touching no path any workflow watches never gets a
+        # check run at all, and a stale_pin fix that only deletes an ignore
+        # entry is exactly that shape. Waiting for a verdict that is never
+        # coming would hold the slot forever.
+        if not checks.get("has_checks") and (
+            time.time() - run["updated_at"] > config.CI_APPEAR_TIMEOUT_SECONDS
+        ):
+            escalate(conn, run, pin,
+                     "no CI ran for this change, so it cannot be verified automatically")
         return
     if checks["head_sha"] == run["judged_sha"]:
         # We already ruled on this commit and asked for a repair. GitHub will
