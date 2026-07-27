@@ -25,7 +25,7 @@ def loop() -> None:
 
 def main() -> None:
     threading.Thread(target=loop, daemon=True, name="reconciler").start()
-    uvicorn.run(app, host="0.0.0.0", port=8090, log_level="warning")
+    uvicorn.run(app, host="0.0.0.0", port=config.PORT, log_level="warning")
 
 
 if __name__ == "__main__":

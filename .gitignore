@@ -4,3 +4,5 @@ __pycache__/
 .venv/
 orchestrator.log
 spike/state.json
+.run/
+DEMO.md

@@ -7,9 +7,22 @@ import time
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
-from . import controller, store
+from . import config, controller, store
 
 app = FastAPI(title="graveyard-shift")
+
+
+@app.get("/api/health")
+def health() -> dict:
+    """Liveness of the reconciler, which a converged system cannot show through
+    its data because it stops writing any."""
+    return {
+        "ticks_completed": controller.TICKS_COMPLETED,
+        "tick_seconds": config.TICK_SECONDS,
+        "fork": config.FORK,
+        "pin_allowlist": config.PIN_ALLOWLIST,
+        "max_concurrent": config.MAX_CONCURRENT_RUNS,
+    }
 
 
 @app.get("/api/metrics")

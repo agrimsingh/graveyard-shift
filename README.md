@@ -259,7 +259,9 @@ docker compose up --build
 ```
 
 The dashboard is at http://localhost:8090. It reconciles every 60 seconds, and
-`POST /api/tick` forces one immediately.
+`POST /api/tick` forces one immediately. `GET /api/health` reports completed
+reconciliation passes, which is the only way to see that the reconciler is alive
+once the audit has converged and stopped writing anything.
 
 Prepare a fork before the first run. This installs a focused CI workflow and
 disables the roughly thirty-five inherited Superset workflows, so that "green"
@@ -275,7 +277,7 @@ The full workflow replays against the real controller with the Devin and GitHub
 calls faked, so it needs no API key and spends no ACUs:
 
 ```bash
-.venv/bin/python scripts/simulate.py
+make simulate     # or: .venv/bin/python scripts/simulate.py
 # or, with nothing installed but Docker:
 docker compose run --rm -e DEVIN_API_KEY=x -e DEVIN_ORG_ID=x \
   orchestrator python scripts/simulate.py
@@ -290,7 +292,7 @@ only advances when Devin pushes, and Devin never idles after answering. Both
 model failures that a friendlier fake hid for most of this project.
 
 ```bash
-.venv/bin/python scripts/verify_convergence.py
+make verify       # or: .venv/bin/python scripts/verify_convergence.py
 ```
 
 Proves admission converges: eight seeded situations, each asserting the exact
@@ -395,4 +397,5 @@ but the point was to prove the loop end to end rather than to maximise a funnel.
 | `scripts/simulate.py` | Full workflow replay, no credentials needed |
 | `scripts/verify_convergence.py` | Regression cover for admission |
 | `scripts/setup_fork_ci.sh` | Fork preparation |
+| `scripts/service.py` | Start/stop the orchestrator through a PID file |
 | `spike/spike.py` | Environment check against a live Devin session |

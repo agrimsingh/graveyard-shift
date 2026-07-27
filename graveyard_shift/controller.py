@@ -10,8 +10,13 @@ from . import config, dependabot, devin, gh, prompts, store, watches
 
 logger = logging.getLogger("graveyard")
 
+# Completed reconciliation passes. Liveness of the reconciler is not visible
+# from the data alone, because a converged system writes nothing.
+TICKS_COMPLETED = 0
+
 
 def tick() -> None:
+    global TICKS_COMPLETED
     with store.db() as conn:
         try:
             sync_pins(conn)
@@ -21,6 +26,7 @@ def tick() -> None:
             logger.exception("pin sync failed; reconciling existing runs anyway")
         reconcile_runs(conn)
         admit(conn)
+    TICKS_COMPLETED += 1
 
 
 def sync_pins(conn) -> None:

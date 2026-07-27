@@ -35,6 +35,7 @@ CI_APPEAR_TIMEOUT_SECONDS = int(os.environ.get("GS_CI_APPEAR_TIMEOUT", "600"))
 RECHECK_DAYS = int(os.environ.get("GS_RECHECK_DAYS", "14"))
 CONFIDENCE_THRESHOLD = float(os.environ.get("GS_CONFIDENCE", "0.6"))
 TICK_SECONDS = int(os.environ.get("GS_TICK_SECONDS", "60"))
+PORT = int(os.environ.get("GS_PORT", "8090"))
 
 # Pins the controller may admit. Empty means all discovered pins are eligible.
 PIN_ALLOWLIST = [
