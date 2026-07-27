@@ -38,9 +38,12 @@ FUTURE = 9_999_999_999.0
 KEEP = object()
 
 
-def seed(dependency: str, state: str | None, due_at, watch=None, entry_hash="h1") -> None:
+def seed(dependency: str, state: str | None, due_at, watch=None, entry_hash="h1",
+         reason: str | None = None) -> None:
+    # Each case is its own work item unless a test deliberately shares a reason.
+    reason = reason or f"reason for {dependency}"
     with store.db() as conn:
-        pin = store.upsert_pin(conn, dependency, "/superset-frontend/", "reason", entry_hash)
+        pin = store.upsert_pin(conn, dependency, "/superset-frontend/", reason, entry_hash)
         if state is not None:
             run_id = store.create_run(conn, pin["id"], "old-session", "https://old")
             conn.execute("UPDATE runs SET state = ? WHERE id = ?", (state, run_id))
@@ -99,6 +102,12 @@ seed("changed-entry", store.GREEN, None)
 ticks(1)
 seed("changed-entry", None, KEEP, entry_hash="h2")
 results.append(case("changed dependabot entry re-arms exactly once", 1, ticks(5)))
+
+# Five React pins sharing one TODO are one migration. Auditing each of them
+# separately produced two sessions racing on the same 6,800 line upgrade.
+for dep in ("grouped-a", "grouped-b", "grouped-c"):
+    seed(dep, None, 0, reason="blocked on the same migration")
+results.append(case("pins sharing a justification run one at a time", 1, ticks(5)))
 
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

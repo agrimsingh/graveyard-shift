@@ -147,6 +147,28 @@ def active_runs(conn) -> list:
     ).fetchall()
 
 
+def group_key(pin) -> str:
+    """Pins sharing a justification comment are one piece of work, because a
+    Dependabot author writes one comment above the block of entries that move
+    together. A blank comment groups nothing: that is the absence of a stated
+    reason, not a shared one."""
+    reason = (pin["reason"] or "").strip()
+    return reason or f"ungrouped:{pin['id']}"
+
+
+def active_group_keys(conn) -> set:
+    """Group keys of pins that already have a run in flight."""
+    placeholders = ",".join("?" * len(ACTIVE))
+    return {
+        group_key(row)
+        for row in conn.execute(
+            f"SELECT DISTINCT p.* FROM pins p JOIN runs r ON r.pin_id = p.id"
+            f" WHERE r.state IN ({placeholders})",
+            tuple(ACTIVE),
+        )
+    }
+
+
 def run_for_pin(conn, pin_id: int):
     return conn.execute(
         "SELECT * FROM runs WHERE pin_id = ? ORDER BY id DESC LIMIT 1", (pin_id,)

@@ -36,10 +36,17 @@ def admit(conn) -> None:
     if capacity <= 0:
         return
     now = time.time()
+    # A Dependabot author writes one comment above a block of entries because
+    # those entries move together. Five React pins sharing one TODO are one
+    # migration, not five, so admitting a second member while the first is in
+    # flight buys a duplicate session and a conflicting pull request.
+    busy_groups = store.active_group_keys(conn)
     for pin in conn.execute("SELECT * FROM pins").fetchall():
         if capacity <= 0:
             return
         if config.PIN_ALLOWLIST and pin["dependency"] not in config.PIN_ALLOWLIST:
+            continue
+        if store.group_key(pin) in busy_groups:
             continue
         last = store.run_for_pin(conn, pin["id"])
         if last is not None and last["state"] in store.ACTIVE:
@@ -56,6 +63,7 @@ def admit(conn) -> None:
         if due_at is None or due_at > now:
             continue
         launch(conn, pin)
+        busy_groups.add(store.group_key(pin))
         capacity -= 1
 
 
