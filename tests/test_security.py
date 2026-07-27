@@ -90,6 +90,54 @@ class TickAuthenticationTests(unittest.TestCase):
 
         self.assertNotEqual(401, response.status_code)
 
+    def test_dashboard_uses_a_one_time_nonce_without_exposing_the_control_token(self) -> None:
+        clean_status = {
+            "ticks_completed": 1,
+            "last_tick_started_at": 10.0,
+            "last_tick_completed_at": 11.0,
+            "last_tick_error": None,
+            "last_tick_error_at": None,
+        }
+        with (
+            mock.patch.object(config, "CONTROL_TOKEN", "reusable-control-secret"),
+            mock.patch.object(web, "_DASHBOARD_NONCE", "one-time-page-nonce"),
+            mock.patch.object(web.controller, "tick") as tick,
+            mock.patch.object(web.controller, "status", return_value=clean_status),
+        ):
+            missing = self.client.post("/api/tick/dashboard")
+            wrong = self.client.post(
+                "/api/tick/dashboard",
+                headers={"X-Dashboard-Nonce": "wrong-page-nonce"},
+            )
+            accepted = self.client.post(
+                "/api/tick/dashboard",
+                headers={"X-Dashboard-Nonce": "one-time-page-nonce"},
+            )
+            replayed = self.client.post(
+                "/api/tick/dashboard",
+                headers={"X-Dashboard-Nonce": "one-time-page-nonce"},
+            )
+
+        self.assertEqual(403, missing.status_code)
+        self.assertEqual(403, wrong.status_code)
+        self.assertEqual(200, accepted.status_code)
+        self.assertEqual(403, replayed.status_code)
+        tick.assert_called_once_with()
+
+    def test_dashboard_tick_fails_closed_without_control_configuration(self) -> None:
+        with (
+            mock.patch.object(config, "CONTROL_TOKEN", ""),
+            mock.patch.object(web, "_DASHBOARD_NONCE", "one-time-page-nonce"),
+            mock.patch.object(web.controller, "tick") as tick,
+        ):
+            response = self.client.post(
+                "/api/tick/dashboard",
+                headers={"X-Dashboard-Nonce": "one-time-page-nonce"},
+            )
+
+        self.assertEqual(503, response.status_code)
+        tick.assert_not_called()
+
 
 class HealthObservabilityTests(unittest.TestCase):
     def test_health_includes_controller_success_and_error_status(self) -> None:
@@ -134,7 +182,7 @@ class DashboardSafetyTests(unittest.TestCase):
         }
 
         class Connection:
-            def execute(self, query):
+            def execute(self, query, _params=()):
                 rows = [event] if "FROM events" in query else [run]
                 return mock.Mock(fetchall=mock.Mock(return_value=rows))
 
@@ -163,6 +211,33 @@ class DashboardSafetyTests(unittest.TestCase):
         self.assertIn(
             "href='https://github.com/agrimsingh/superset/pull/123'", body
         )
+
+    def test_dashboard_renders_browser_control_without_the_reusable_token(self) -> None:
+        class Connection:
+            def execute(self, query, _params=()):
+                return mock.Mock(fetchall=mock.Mock(return_value=[]))
+
+        @contextlib.contextmanager
+        def fake_db():
+            yield Connection()
+
+        with (
+            mock.patch.object(config, "CONTROL_TOKEN", "reusable-control-secret"),
+            mock.patch.object(web, "_DASHBOARD_NONCE", "one-time-page-nonce"),
+            mock.patch.object(web.store, "db", fake_db),
+            mock.patch.object(web.store, "active_runs", return_value=[]),
+            mock.patch.object(
+                web.store,
+                "metrics",
+                return_value={"pins": 0, "runs_by_state": {}},
+            ),
+        ):
+            response = TestClient(web.app).get("/")
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn('id="start-audit"', response.text)
+        self.assertIn("one-time-page-nonce", response.text)
+        self.assertNotIn("reusable-control-secret", response.text)
 
 
 class PromptBoundaryTests(unittest.TestCase):

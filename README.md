@@ -287,7 +287,9 @@ Docker publishes it only on `127.0.0.1`, because the read routes are
 unauthenticated and disclose the fork under audit, the pins in flight, and live
 Devin session URLs. `GS_BIND=0.0.0.0` exposes it to the network, which is what
 the container sets internally so the published loopback port can reach it. It
-reconciles every 60 seconds. The manual trigger requires the bearer token:
+reconciles every 60 seconds. The dashboard's **start audit** button uses a
+process-local, one-time page nonce, so the reusable control token is never sent
+to the browser. The CLI trigger requires that bearer token:
 
 ```bash
 make tick    # reads GS_CONTROL_TOKEN from .env

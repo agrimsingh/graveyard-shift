@@ -271,7 +271,7 @@ def preflight() -> None:
         "GS_TICK_SECONDS": str(QUIET_TICK_SECONDS),
     })
     notes.append(f"orchestrator running as pid {pid}, scoped to {DEMO_PIN}, "
-                 "reconciler quiet so your tick is the trigger")
+                 "reconciler quiet so start audit is the trigger")
 
     # Arm only after the startup pass has finished, or it claims the pin first
     # and the live trigger has nothing to do.
@@ -300,7 +300,7 @@ def preflight() -> None:
                 "a run started during preflight, so the live trigger would have "
                 "nothing to do. Rerun this script."
             )
-    notes.append(f"{DEMO_PIN} armed, nothing running, waiting for your tick")
+    notes.append(f"{DEMO_PIN} armed, nothing running, waiting for start audit")
 
     check_tabs()
     notes.append(f"all {len(TABS)} tabs load")
@@ -314,11 +314,11 @@ def preflight() -> None:
        {summary['audits_completed']} audits, {summary['green_prs']} green PRs, """
           f"""{summary['runs_by_state'].get(store.BLOCKED_UPSTREAM, 0)} upstream blocks, """
           f"""{summary['runs_by_state'].get(store.ESCALATED, 0)} escalations
-    2. make tick
-       (reads the token from .env, so nothing secret appears on screen)
-    3. refresh the dashboard, open the new Devin session, leave it working
+    2. click start audit on the dashboard
+       (the one-time browser control fires the same reconciliation pass)
+    3. after the page reloads, open the new Devin session and leave it working
 
-  Afterwards: .venv/bin/python scripts/demo_preflight.py --stop""")
+  Afterwards: make demo-stop""")
 
 
 def main() -> None:

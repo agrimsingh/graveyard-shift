@@ -2,7 +2,9 @@
 is this working, what did it cost, where are the humans needed."""
 
 import html
+import json
 import secrets
+import threading
 import time
 from urllib.parse import urlsplit
 
@@ -12,6 +14,8 @@ from fastapi.responses import HTMLResponse
 from . import config, controller, store
 
 app = FastAPI(title="graveyard-shift")
+_DASHBOARD_NONCE = secrets.token_urlsafe(32)
+_DASHBOARD_NONCE_LOCK = threading.Lock()
 
 
 @app.get("/api/health")
@@ -72,6 +76,36 @@ def trigger_tick(authorization: str | None = Header(default=None)) -> dict:
             detail="valid bearer token required",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    return _execute_tick()
+
+
+@app.post("/api/tick/dashboard")
+def trigger_tick_from_dashboard(
+    x_dashboard_nonce: str | None = Header(default=None),
+) -> dict:
+    """Browser control for the loopback-only dashboard.
+
+    The reusable control token never enters the page. Instead the page receives
+    a process-local, one-time nonce. Cross-origin callers cannot read it, and a
+    replay after a successful trigger is rejected.
+    """
+    if not config.CONTROL_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="manual tick control is disabled until GS_CONTROL_TOKEN is configured",
+        )
+    global _DASHBOARD_NONCE
+    with _DASHBOARD_NONCE_LOCK:
+        if (
+            x_dashboard_nonce is None
+            or not secrets.compare_digest(x_dashboard_nonce, _DASHBOARD_NONCE)
+        ):
+            raise HTTPException(status_code=403, detail="dashboard control expired; refresh")
+        _DASHBOARD_NONCE = secrets.token_urlsafe(32)
+    return _execute_tick()
+
+
+def _execute_tick() -> dict:
     controller.tick()
     tick_status = controller.status()
     error_at = tick_status["last_tick_error_at"]
@@ -122,6 +156,7 @@ def _link(value, label: str) -> str:
 def dashboard() -> str:
     with store.db() as conn:
         summary = store.metrics(conn)
+        has_active_runs = bool(store.active_runs(conn))
         run_rows = conn.execute(
             "SELECT r.*, p.dependency, p.issue_number,"
             " r.id <> (SELECT id FROM runs WHERE pin_id = r.pin_id"
@@ -175,6 +210,38 @@ def dashboard() -> str:
         f"{_text(e['detail'][:120])}</li>"
         for e in event_rows
     )
+    if config.CONTROL_TOKEN:
+        if has_active_runs:
+            control = (
+                "<div class='controls'><button disabled>audit running</button>"
+                "<span>Open the active Devin session below.</span></div>"
+            )
+        else:
+            nonce = json.dumps(_DASHBOARD_NONCE)
+            control = f"""<div class="controls">
+<button id="start-audit">start audit</button><span id="control-status">
+Start one reconciliation pass.</span></div>
+<script>
+const startAudit = document.getElementById("start-audit");
+const controlStatus = document.getElementById("control-status");
+startAudit.addEventListener("click", async () => {{
+  startAudit.disabled = true;
+  controlStatus.textContent = "Starting Devin session...";
+  try {{
+    const response = await fetch("/api/tick/dashboard", {{
+      method: "POST",
+      headers: {{"X-Dashboard-Nonce": {nonce}}}
+    }});
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.detail || `HTTP ${{response.status}}`);
+    window.location.reload();
+  }} catch (error) {{
+    controlStatus.textContent = `${{error.message}} Refresh to try again.`;
+  }}
+}});
+</script>"""
+    else:
+        control = ""
     return f"""<!doctype html><html><head><title>graveyard-shift</title>
 <meta http-equiv="refresh" content="30">
 <style>
@@ -188,8 +255,13 @@ td, th {{ padding: 8px 10px; border-bottom: 1px solid #21262d; text-align: left;
 .pill {{ padding: 2px 8px; border-radius: 10px; color: #fff; font-size: .75rem; }}
 ul {{ list-style: none; padding: 0; }} li {{ padding: 2px 0; color: #8b949e; }}
 li b {{ color: #e6edf3; }}
+.controls {{ display: flex; align-items: center; gap: 10px; margin: .75rem 0 1rem; color: #8b949e; }}
+button {{ appearance: none; border: 1px solid #58a6ff; border-radius: 7px; padding: 8px 13px;
+  background: #1f6feb; color: white; font: inherit; font-weight: 600; cursor: pointer; }}
+button:disabled {{ border-color: #30363d; background: #21262d; color: #8b949e; cursor: default; }}
 </style></head><body>
 <h1>graveyard-shift · Dependabot ignore-list audit</h1>
+{control}
 <div class="cards">{cards}</div>
 <table><tr><th>pin</th><th>state</th><th>classification</th><th>confidence</th>
 <th>elapsed</th><th>ci retries</th><th>devin</th><th>pr</th></tr>{rows}</table>
