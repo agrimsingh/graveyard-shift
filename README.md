@@ -145,6 +145,14 @@ pull request while the controller sat waiting for a pause that never came. Every
 transition now keys off a durable artifact — structured output, a PR URL, a
 check conclusion — and never off how busy the session looks.
 
+**A CI verdict belongs to a commit, not to a pull request.** After feedback is
+sent, GitHub keeps reporting the old failure until Devin actually pushes. Read
+that as a fresh result and the run consumes its retry budget and escalates
+before the repair can exist. Runs record the SHA they ruled on; remediating
+waits for a newer commit and `awaiting_ci` ignores a conclusion it has already
+acted on. This is the bug that a naive fake hides, which is why the simulation's
+CI is keyed to a head SHA that only advances when something is pushed.
+
 **The reconciler is idempotent.** Every tick reads the world and advances each
 run by at most one step, so a crash mid-tick loses nothing. Admission consumes
 a pin's due date at launch, which is what stops a due pin from starting a fresh
@@ -240,6 +248,11 @@ green is the defensible signal.
 PRs, so the feedback loop never had a failure to repair, and both pins turned
 out fixable, so no unblock watch was ever armed. Both paths are exercised and
 asserted in `scripts/simulate.py`. Treat them as tested, not as field-proven.
+
+That distinction earned its keep: the repair loop was broken and the live runs
+could not have revealed it, because neither ever failed CI. It only surfaced
+once the simulation's fake stopped flattering the controller. Deleting the
+per-commit guard still makes `simulate.py` fail today.
 
 **Green means the scoped suite.** Superset's full CI matrix is impractical on a
 personal fork, so `scripts/setup_fork_ci.sh` installs a workflow that runs the
