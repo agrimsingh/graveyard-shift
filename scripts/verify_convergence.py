@@ -72,6 +72,11 @@ results.append(case("newly discovered pin starts one session over 5 ticks", 1, t
 seed("expired-due", store.GREEN, PAST)
 results.append(case("expired due date is consumed, not replayed", 1, ticks(5)))
 
+# Pins discovered before due dates were backfilled carried a null date and no
+# run, which made them permanently invisible to admission.
+seed("never-audited", None, None)
+results.append(case("never-audited pin with no due date still runs once", 1, ticks(5)))
+
 seed("settled-green", store.GREEN, None)
 results.append(case("settled green pin never re-audits", 0, ticks(5)))
 

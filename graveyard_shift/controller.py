@@ -45,6 +45,12 @@ def admit(conn) -> None:
         if last is not None and last["state"] in store.ACTIVE:
             continue
         due_at = pin["due_at"]
+        if last is None and due_at is None:
+            # A null due date means "no scheduled reason to run". For a pin
+            # that has never been audited at all there is a standing reason, so
+            # it is due now. This also self-heals a pin whose row was written
+            # before a launch failed partway through.
+            due_at = 0
         if last is not None and last["state"] == store.BLOCKED_UPSTREAM:
             due_at = fire_watch(conn, pin, last) or due_at
         if due_at is None or due_at > now:
