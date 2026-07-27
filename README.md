@@ -34,13 +34,37 @@ merged automatically.
 Working against [agrimsingh/superset](https://github.com/agrimsingh/superset),
 a fork of `apache/superset`:
 
-| Pin | Verdict | Result | Trigger to green |
-| --- | --- | --- | --- |
-| `currencyformatter.js` | `fixable_here` (90%) | [PR #3](https://github.com/agrimsingh/superset/pull/3), green | 10m 25s |
-| `react-checkbox-tree` | `fixable_here` (72%) | [PR #4](https://github.com/agrimsingh/superset/pull/4), green | 14m 49s |
+Ten pins in the ignore list, every one audited:
 
-Both pins had sat in the ignore list behind upstream projects that had not
-shipped a fix. Devin got around both without waiting for either.
+| Pin | Verdict | Result |
+| --- | --- | --- |
+| `currencyformatter.js` | `fixable_here` | [PR #3](https://github.com/agrimsingh/superset/pull/3), green |
+| `react-checkbox-tree` | `fixable_here` | [PR #4](https://github.com/agrimsingh/superset/pull/4), green |
+| `jest-environment-jsdom` | `stale_pin` | [PR #6](https://github.com/agrimsingh/superset/pull/6), green |
+| `react-icons` | `stale_pin` | [PR #12](https://github.com/agrimsingh/superset/pull/12), green |
+| `@swc/plugin-transform-imports` | `stale_pin` | [PR #15](https://github.com/agrimsingh/superset/pull/15), green |
+| `react` | `fixable_here` | [PR #14](https://github.com/agrimsingh/superset/pull/14), a 6,812 line React 18→19 migration |
+| `@types/react` | `blocked_upstream` | parked, watching [apache/superset#42112](https://github.com/apache/superset/pull/42112) |
+| `@types/react-dom` | `blocked_upstream` | parked behind the same migration |
+| `react-dom` | escalated | duplicate of the React 19 work already in flight |
+| `@babel/*` | `blocked_upstream` | parked behind the Babel 8 ecosystem |
+
+Three verdicts, and the interesting thing is that they are interesting in
+different ways.
+
+**`stale_pin` is the cheapest win and the most common.** Three of the ten
+entries were protecting nothing at all. The best of them is
+`jest-environment-jsdom`, where the ignore comment says JSDOM v30 does not play
+well with Jest v30. Devin established that the comment is simply wrong:
+`jest-environment-jsdom` 30.x pins jsdom `^26` internally, so bumping it can
+never pull jsdom 30, and the repo's separate direct `jsdom` dependency is not
+covered by the ignore at all. The entry has been suppressing patch and security
+updates to guard against something it cannot cause. That is a one-line diff
+nobody would ever prioritise finding.
+
+**`fixable_here` is where the judgment lives**, and both cases below were
+originally pinned behind upstream projects that had not shipped a fix. Devin
+got around both without waiting for either.
 
 For `currencyformatter.js` the blocker was a stale peer range in an
 unmaintained helper library. Devin verified the 2.x API was unchanged, routed
@@ -76,6 +100,19 @@ It cited the webpack issue describing the shadowing class of bug, unpacked the
 published tarballs to check which artifacts contained what, and adapted
 `FilterScopeSelector.tsx` to the 2.x API. A dependency bot cannot produce that.
 
+**`blocked_upstream` is a real answer, not a failure**, provided the pin comes
+back on its own. `@types/react` is parked behind
+[apache/superset#42112](https://github.com/apache/superset/pull/42112), the
+coordinated React 19 upgrade, as a condition the controller re-checks every
+tick for nothing:
+
+```json
+{"kind": "github_pr_merged", "repo": "apache/superset", "pr_number": 42112}
+```
+
+No timer, no re-asking Devin, no ACUs. The pin re-audits itself the hour that
+migration lands.
+
 ### The prompt was the lever, not the model
 
 Worth being direct about, because it is the most transferable finding here.
@@ -93,6 +130,39 @@ pull requests.
 
 The agent's judgment is bounded by the question it is handed. The leverage came
 from asking for the workaround.
+
+### The agent argued for its own next feature
+
+Three React pins came back `blocked_upstream` and all three asked to watch the
+same thing: apache/superset#42112, the coordinated React 19 migration. None of
+them could say so. The watch vocabulary only spoke npm versions, so each one
+degraded to a prose note and a blind fourteen-day recheck for a condition that
+is one API call to evaluate.
+
+They were right and the schema was wrong. The commonest gate in a mature
+repository is not a package release, it is a migration that has not landed.
+Adding a `github_pr_merged` watch was about thirty lines, and it is worth
+noticing where the requirement came from: three independent structured outputs
+saying the same thing, which is a signal you only get if you make the agent
+answer in a machine-readable shape and then read what it could not express.
+
+### Five pins, one job
+
+Superset's ignore list has five React entries under a single TODO. They are one
+migration, and the controller originally audited them as five independent
+pins — so `react` opened a 6,812 line upgrade while `react-dom` started a
+second session on the same work.
+
+Devin had already worked this out. Its own summary for `react-dom` said the
+package "cannot be bumped independently of react/@types/react". The agent knew
+the pins were coupled and the orchestrator had no way to represent it, which is
+the more general failure: the model's understanding was better than the domain
+model it was reporting into.
+
+A Dependabot author writes one comment above the block of entries that move
+together, so the comment is the grouping signal, and admission now runs at most
+one member of a group at a time. Full group-level remediation — one branch that
+clears all five entries — is the obvious next step and is not built.
 
 ## How it works
 
@@ -233,8 +303,9 @@ answers "where does this pin stand now" rather than "how many attempts have
 there been". Superseded runs stay in the feed. Every run links to its Devin
 session, so any number can be traced to the work that produced it.
 
-Current state of the Superset fork: 2 pins audited, 100% actionable, 2 green
-PRs, 2/2 first-pass CI, median 10m 29s trigger to PR, no escalations.
+Current state of the Superset fork: 10 pins tracked and audited, 78%
+actionable, 5 green PRs, median 10m 29s trigger to PR and 12m 37s trigger to
+green, 1 CI repair round, 1 escalation.
 
 ### Honest caveats
 
@@ -244,15 +315,18 @@ number would be fabricated. Consumption is still recorded per run and the
 figure becomes meaningful on a metered account. Until then wall-clock time to
 green is the defensible signal.
 
-**Two of the best behaviours never fired live.** CI passed first time on both
-PRs, so the feedback loop never had a failure to repair, and both pins turned
-out fixable, so no unblock watch was ever armed. Both paths are exercised and
-asserted in `scripts/simulate.py`. Treat them as tested, not as field-proven.
+**The repair loop was broken until the fake stopped flattering it.** For most
+of this project CI passed first time on every PR, so the feedback path never
+ran, and the simulation covering it returned success on the second poll
+regardless of whether anything had been pushed. Both together hid a controller
+that could not repair anything: it re-read the pre-existing failure as a fresh
+verdict and escalated within two ticks. Keying the fake's CI to a head SHA
+exposed it, and deleting the per-commit guard still makes `simulate.py` fail
+today. The loop has since fired for real, on PR #14.
 
-That distinction earned its keep: the repair loop was broken and the live runs
-could not have revealed it, because neither ever failed CI. It only surfaced
-once the simulation's fake stopped flattering the controller. Deleting the
-per-commit guard still makes `simulate.py` fail today.
+Treat `scripts/simulate.py` as the specification of behaviour that live runs
+have not all reached yet, and treat a green test suite as worth exactly as much
+as its harshest fake.
 
 **Green means the scoped suite.** Superset's full CI matrix is impractical on a
 personal fork, so `scripts/setup_fork_ci.sh` installs a workflow that runs the
