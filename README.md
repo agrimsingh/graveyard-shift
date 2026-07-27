@@ -43,7 +43,7 @@ Ten pins in the ignore list, every one audited:
 | `jest-environment-jsdom` | `stale_pin` | [PR #6](https://github.com/agrimsingh/superset/pull/6), green |
 | `react-icons` | `stale_pin` | [PR #12](https://github.com/agrimsingh/superset/pull/12), green |
 | `@swc/plugin-transform-imports` | `stale_pin` | [PR #15](https://github.com/agrimsingh/superset/pull/15), green |
-| `react` | `fixable_here` | [PR #14](https://github.com/agrimsingh/superset/pull/14), a 6,812 line React 18→19 migration, one CI repair round |
+| `react` | `fixable_here` | [PR #14](https://github.com/agrimsingh/superset/pull/14), a 6,812 line React 18→19 migration, escalated after its repair round |
 | `@types/react` | `blocked_upstream` | parked, watching [apache/superset#42112](https://github.com/apache/superset/pull/42112) |
 | `@types/react-dom` | `blocked_upstream` | parked behind the same migration |
 | `react-dom` | escalated | duplicate of the React 19 work already in flight |
@@ -317,14 +317,30 @@ answers "where does this pin stand now" rather than "how many attempts have
 there been". Superseded runs stay in the feed. Every run links to its Devin
 session, so any number can be traced to the work that produced it.
 
-Current state of the Superset fork: 10 pins tracked and audited, 5 green PRs,
-5/5 first-pass CI on those, median 10m 29s trigger to PR and 12m 37s trigger to
-green, 1 CI repair round, 1 escalation.
+Final state of the Superset fork: 10 pins tracked and audited, 5 green PRs, 5/5
+first-pass CI on those, median 10m 29s trigger to PR and 14m 49s trigger to
+green, 1 CI repair round, 2 escalations, nothing left running.
 
-The escalation is the interesting number. It is `react-dom`, stopped because
-the React 19 migration it wanted to perform was already in flight on another
-pin's branch. A system that never escalates is not being careful, it is being
-lucky.
+The escalations are the interesting number. A system that never escalates is
+not being careful, it is being lucky.
+
+One is `react-dom`, stopped because the React 19 migration it wanted to perform
+was already in flight on another pin's branch. The other is `react` itself, and
+its event trail is the whole design in six lines:
+
+```
+17:29  run created
+17:34  classified fixable_here
+18:20  opened PR #14, 6,812 lines
+18:42  CI failed, failure logs sent back into the same session
+18:46  Devin pushed a repair commit
+19:04  still failing, escalated to a human
+```
+
+It tried the largest thing in the graveyard, got one repair round, and then
+stopped and handed a human the branch plus the full session history. That is
+the correct outcome for a React 18 to 19 migration, and it is worth more than a
+sixth green PR would have been.
 
 ### Honest caveats
 
