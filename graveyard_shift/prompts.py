@@ -38,6 +38,15 @@ CLASSIFICATION_SCHEMA = {
                 {
                     "type": "object",
                     "properties": {
+                        "kind": {"type": "string", "enum": ["github_pr_merged"]},
+                        "repo": {"type": "string"},
+                        "pr_number": {"type": "integer"},
+                    },
+                    "required": ["kind", "repo", "pr_number"],
+                },
+                {
+                    "type": "object",
+                    "properties": {
                         "kind": {"type": "string", "enum": ["none"]},
                         "note": {"type": "string"},
                     },
@@ -76,11 +85,15 @@ framework-wide migration). Cite the blocking issue/PR/release in evidence.
 removed and the upgrade applied.
 4. Include confidence (0-1), evidence with URLs, proposed_validation (the \
 exact test command that would prove a fix), and estimated_scope.
-5. Set `unblock_watch` to the condition that would clear this pin. For \
-`blocked_upstream`, use \
-`{{"kind":"npm_version","package":"...","min_version":"..."}}` when an npm \
-release is the gate; otherwise `{{"kind":"none","note":"..."}}`. Other \
-classifications may use kind `none`.
+5. Set `unblock_watch` to the condition that would clear this pin, preferring \
+a machine-checkable one so the pin can be re-audited the moment it changes \
+rather than on a blind timer. For `blocked_upstream`:
+   - an unreleased upstream fix -> \
+`{{"kind":"npm_version","package":"...","min_version":"..."}}`
+   - a pull request that has not landed, in this repo or any other -> \
+`{{"kind":"github_pr_merged","repo":"owner/name","pr_number":123}}`
+   - genuinely nothing checkable -> `{{"kind":"none","note":"..."}}`
+Other classifications may use kind `none`.
 
 Stop after providing structured output. You will receive a follow-up message \
 if remediation should proceed. Do not commit, push, or open a PR in phase 1.
