@@ -272,15 +272,29 @@ GS_FORK=you/superset ./scripts/setup_fork_ci.sh
 ### Running without any credentials
 
 The full workflow replays against the real controller with the Devin and GitHub
-calls faked:
+calls faked, so it needs no API key and spends no ACUs:
 
 ```bash
 .venv/bin/python scripts/simulate.py
+# or, with nothing installed but Docker:
+docker compose run --rm -e DEVIN_API_KEY=x -e DEVIN_ORG_ID=x \
+  orchestrator python scripts/simulate.py
 ```
 
-It exercises a fixable pin that needs a CI repair round before going green, a
-pin parked behind an upstream release, and a pin escalated on low confidence,
-then asserts each outcome. Use this to read the system without spending ACUs.
+It exercises four outcomes and asserts each one: a fixable pin that needs a CI
+repair round before going green, a pin parked behind an upstream release, a pin
+escalated on low confidence, and a config-only fix that no workflow watches.
+
+The fakes are deliberately unkind. CI results are keyed to a head commit that
+only advances when Devin pushes, and Devin never idles after answering. Both
+model failures that a friendlier fake hid for most of this project.
+
+```bash
+.venv/bin/python scripts/verify_convergence.py
+```
+
+Proves admission converges: eight seeded situations, each asserting the exact
+number of Devin sessions a repeated tick may start.
 
 ## Knowing whether it works
 
